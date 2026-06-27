@@ -1031,22 +1031,36 @@ class CVMM(torch.autograd.Function):
                 grouped_bytes += keys_dt.numel() * torch.finfo(torch.float32).bits // 8
             if need_grad_x:
                 grouped_bytes += total_routes * out_index.element_size()
-            can_grouped_backward = grouped_bytes <= 3 * 1024 * 1024 * 1024
+
+            free_vram, total_vram = torch.cuda.mem_get_info(x.device)
+            reserve_bytes = max(total_vram // 20, 512 * 1024 * 1024)
+            scratch_limit = max(free_vram - reserve_bytes, 0) // 2
+            if grouped_bytes <= scratch_limit:
+                can_grouped_backward = True
+            else:
+                allocator_slack = torch.cuda.memory_reserved(x.device) - torch.cuda.memory_allocated(x.device)
+                available_vram = free_vram + max(allocator_slack, 0)
+                scratch_limit = max(available_vram - reserve_bytes, 0) // 2
+                can_grouped_backward = grouped_bytes <= scratch_limit
 
         if can_grouped_backward:
-            grad_x, grad_w = cvmm_grouped_backward_call(
-                x,
-                out_index,
-                sel,
-                grad_output,
-                keys_dt,
-                keys_dt.shape[0],
-                ctx.keys_type,
-                ctx.dtype,
-                top_k,
-                need_grad_x,
-                need_grad_keys
-            )
+            try:
+                grad_x, grad_w = cvmm_grouped_backward_call(
+                    x,
+                    out_index,
+                    sel,
+                    grad_output,
+                    keys_dt,
+                    keys_dt.shape[0],
+                    ctx.keys_type,
+                    ctx.dtype,
+                    top_k,
+                    need_grad_x,
+                    need_grad_keys
+                )
+            except torch.OutOfMemoryError:
+                grad_x = None
+                grad_w = None
 
         if need_grad_keys and grad_w is None:
             # Backward for weight
