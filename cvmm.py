@@ -44,9 +44,12 @@ def dtype_to_type_id(dtype: torch.dtype):
 
 
 cvmm_triton_call = None
+cvmm_triton_accumulate_call = None
+cvmm_triton_reduction_call = None
+cvmm_reduction_tuned_shapes = set()
 
 def create_kernels():
-    global cvmm_backward_kernel3, cvmm_triton_call
+    global cvmm_backward_kernel3, cvmm_triton_call, cvmm_triton_accumulate_call, cvmm_triton_reduction_call
 
     if cvmm_triton_call is not None:
         return
@@ -69,7 +72,7 @@ def create_kernels():
             triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=2),
             triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
         ],
-        key=['M', 'N', 'K', 'dtype_id', 'allow_tf32']
+        key=['M', 'N', 'K', 'dtype_id', 'out_dtype_id', 'allow_tf32']
     )
     @triton.jit
     def cvmm_kernel(
@@ -85,7 +88,8 @@ def create_kernels():
         stride_cm, stride_cn,
         stride_index, stride_sel, stride_out_index,
         out_index_is_none: tl.constexpr,
-        dtype_id: tl.constexpr, allow_tf32: tl.constexpr,
+        dtype_id: tl.constexpr, out_dtype_id: tl.constexpr, allow_tf32: tl.constexpr,
+        ACCUMULATE_OUTPUT: tl.constexpr,
         # Meta-parameters
         BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
         GROUP_SIZE_M: tl.constexpr
@@ -159,9 +163,9 @@ def create_kernels():
                 b_ptrs += BLOCK_SIZE_K * stride_bk
 
 
-            if dtype_id == 1:
+            if out_dtype_id == 1:
                 c = accumulator.to(tl.float16)
-            elif dtype_id == 2:
+            elif out_dtype_id == 2:
                 c = accumulator.to(tl.bfloat16)
             else:
                 c = accumulator
@@ -178,7 +182,80 @@ def create_kernels():
             offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
             c_ptrs = c_ptr + stride_cm * remap_offs_cm[:, None] + stride_cn * offs_cn[None, :]
             c_mask = ((offs_cm[:, None] < M) & (sel_all[:, None] == matrix_id)) & (offs_cn[None, :] < N)
-            tl.store(c_ptrs, c, mask=c_mask)
+            if ACCUMULATE_OUTPUT:
+                c_prev = tl.load(c_ptrs, mask=c_mask, other=0.0)
+                tl.store(c_ptrs, c_prev + c, mask=c_mask)
+            else:
+                tl.store(c_ptrs, c, mask=c_mask)
+
+
+    @triton.autotune(
+        configs=[
+            triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
+            triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=4),
+            triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
+            triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=4),
+            triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=4),
+            triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=4),
+        ],
+        key=['M', 'N', 'K', 'dtype_id', 'REDUCE_SIZE', 'allow_tf32']
+    )
+    @triton.jit
+    def cvmm_reduction_kernel(
+        a_ptr, b_ptr, c_ptr, index_ptr, sel_ptr,
+        M, N, K,
+        stride_am, stride_ak,
+        stride_bo, stride_bk, stride_bn,
+        stride_cm, stride_cn,
+        stride_index, stride_sel,
+        dtype_id: tl.constexpr, allow_tf32: tl.constexpr, REDUCE_SIZE: tl.constexpr,
+        BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+        GROUP_SIZE_M: tl.constexpr
+    ):
+        pid = tl.program_id(axis=0)
+
+        num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+        num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+        num_pid_in_group = GROUP_SIZE_M * num_pid_n
+        group_id = pid // num_pid_in_group
+        first_pid_m = group_id * GROUP_SIZE_M
+        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+        pid_n = (pid % num_pid_in_group) // group_size_m
+        pid_m = first_pid_m + (pid % group_size_m)
+
+        sel_first = tl.load(sel_ptr + pid_m * BLOCK_SIZE_M * stride_sel)
+        sel_last = tl.load(sel_ptr + (min((pid_m + 1) * BLOCK_SIZE_M, M) - 1) * stride_sel)
+        sel_all = tl.load(sel_ptr + stride_sel * ((pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M))
+
+        for matrix_id in range(sel_first, sel_last + 1):
+            offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+            offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+            remap_offs_am = tl.load(index_ptr + stride_index * offs_am)
+
+            offs_k = tl.arange(0, BLOCK_SIZE_K)
+            a_ptrs = a_ptr + (remap_offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+            b_ptrs = b_ptr + matrix_id * stride_bo + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+
+            accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+            for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+                a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
+                b = tl.load(b_ptrs, mask=(offs_k[:, None] < K - k * BLOCK_SIZE_K) & (offs_bn[None, :] < N), other=0.0)
+                if dtype_id == 1:
+                    a = a.to(tl.float16)
+                    b = b.to(tl.float16)
+                elif dtype_id == 2:
+                    a = a.to(tl.bfloat16)
+                    b = b.to(tl.bfloat16)
+                accumulator += tl.dot(a, b, allow_tf32=allow_tf32)
+                a_ptrs += BLOCK_SIZE_K * stride_ak
+                b_ptrs += BLOCK_SIZE_K * stride_bk
+
+            offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+            offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+            remap_offs_cm = remap_offs_am // REDUCE_SIZE
+            c_ptrs = c_ptr + stride_cm * remap_offs_cm[:, None] + stride_cn * offs_cn[None, :]
+            c_mask = ((offs_cm[:, None] < M) & (sel_all[:, None] == matrix_id)) & (offs_cn[None, :] < N)
+            tl.atomic_add(c_ptrs, accumulator, mask=c_mask)
 
 
     def _prune_backward_configs(configs, named_args, **kwargs):
@@ -370,7 +447,7 @@ def create_kernels():
 
 
     if version.parse(torch.__version__) >= version.parse("2.2.0"):
-        torch.library.define("mylib::cvmm_triton", "(Tensor x, Tensor sel_index, Tensor sel, Tensor keys, ScalarType out_dtype, Tensor out_index) -> Tensor")
+        torch.library.define("mylib::cvmm_triton", "(Tensor x, Tensor sel_index, Tensor sel, Tensor keys, ScalarType out_dtype, Tensor out_index, ScalarType op_dtype) -> Tensor")
         lib_decorator = torch.library.impl("mylib::cvmm_triton", "default")
     else:
         lib_decorator = lambda x: x
@@ -382,7 +459,8 @@ def create_kernels():
         sel: torch.Tensor,
         keys: torch.Tensor,
         out_dtype: torch.dtype,
-        out_index: torch.Tensor
+        out_index: torch.Tensor,
+        op_dtype: torch.dtype
     ):
         x = x.flatten(end_dim=-2)
         assert x.shape[-1] == keys.shape[1]
@@ -416,10 +494,106 @@ def create_kernels():
             out.stride(0), out.stride(1),
             sel_index.stride(0), sel.stride(0), 0 if out_index_is_none else out_index.stride(0),
             out_index_is_none=out_index_is_none,
-            dtype_id = dtype_to_type_id(out.dtype), allow_tf32=False, #torch.backends.cuda.matmul.allow_tf32
+            dtype_id=dtype_to_type_id(op_dtype),
+            out_dtype_id=dtype_to_type_id(out.dtype),
+            allow_tf32=False, #torch.backends.cuda.matmul.allow_tf32
+            ACCUMULATE_OUTPUT=False,
         )
 
         return out.view(*sel_shape, N)
+
+
+    def cvmm_triton_accumulate(
+        x: torch.Tensor,
+        sel_index: torch.Tensor,
+        sel: torch.Tensor,
+        keys: torch.Tensor,
+        out: torch.Tensor,
+        op_dtype: torch.dtype,
+        accumulate: bool
+    ):
+        x = x.flatten(end_dim=-2)
+        assert x.shape[-1] == keys.shape[1]
+
+        sel = sel.flatten()
+        M = sel.shape[0]
+        O, K, N = keys.shape
+        assert out.shape == (M, N)
+
+        out_index = sel_index.new_tensor(-1)
+        grid = lambda META: (
+            triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']),
+        )
+
+        cvmm_kernel[grid](
+            x, keys, out, sel_index, sel, out_index,
+            M, N, K,
+            x.stride(0), x.stride(1),
+            keys.stride(0), keys.stride(1), keys.stride(2),
+            out.stride(0), out.stride(1),
+            sel_index.stride(0), sel.stride(0), 0,
+            out_index_is_none=True,
+            dtype_id=dtype_to_type_id(op_dtype),
+            out_dtype_id=dtype_to_type_id(out.dtype),
+            allow_tf32=False, #torch.backends.cuda.matmul.allow_tf32
+            ACCUMULATE_OUTPUT=accumulate,
+        )
+
+
+    def cvmm_triton_reduction(
+        x: torch.Tensor,
+        sel_index: torch.Tensor,
+        sel: torch.Tensor,
+        keys: torch.Tensor,
+        op_dtype: torch.dtype,
+        out_dtype: torch.dtype,
+        reduce_size: int
+    ):
+        x = x.flatten(end_dim=-2)
+        assert x.shape[-1] == keys.shape[1]
+
+        sel_shape = sel.shape
+        sel = sel.flatten()
+
+        M = sel.shape[0]
+        O, K, N = keys.shape
+        assert M % reduce_size == 0
+
+        out = torch.zeros((M // reduce_size, N), device=x.device, dtype=out_dtype)
+        grid = lambda META: (
+            triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']),
+        )
+
+        dtype_id = dtype_to_type_id(op_dtype)
+        tune_key = (x.device.index, M, N, K, dtype_id, reduce_size)
+        if tune_key not in cvmm_reduction_tuned_shapes:
+            scratch = torch.empty_like(out)
+            cvmm_reduction_kernel[grid](
+                x, keys, scratch, sel_index, sel,
+                M, N, K,
+                x.stride(0), x.stride(1),
+                keys.stride(0), keys.stride(1), keys.stride(2),
+                scratch.stride(0), scratch.stride(1),
+                sel_index.stride(0), sel.stride(0),
+                dtype_id=dtype_id,
+                allow_tf32=False, #torch.backends.cuda.matmul.allow_tf32
+                REDUCE_SIZE=reduce_size,
+            )
+            cvmm_reduction_tuned_shapes.add(tune_key)
+
+        cvmm_reduction_kernel[grid](
+            x, keys, out, sel_index, sel,
+            M, N, K,
+            x.stride(0), x.stride(1),
+            keys.stride(0), keys.stride(1), keys.stride(2),
+            out.stride(0), out.stride(1),
+            sel_index.stride(0), sel.stride(0),
+            dtype_id=dtype_id,
+            allow_tf32=False, #torch.backends.cuda.matmul.allow_tf32
+            REDUCE_SIZE=reduce_size,
+        )
+
+        return out.view(*sel_shape[:-1], N)
 
 
     if version.parse(torch.__version__) >= version.parse("2.2.0"):
@@ -429,7 +603,7 @@ def create_kernels():
             decorator = torch.library.impl_abstract
 
         @decorator("mylib::cvmm_triton", cvmm_triton)
-        def cvmm_triton_abstract(x, sel_idx, sel, keys, out_dtype, out_index):
+        def cvmm_triton_abstract(x, sel_idx, sel, keys, out_dtype, out_index, op_dtype):
             sel_shape = sel.shape
             sel = sel.flatten()
             M = sel.shape[0]
@@ -443,6 +617,8 @@ def create_kernels():
         cvmm_triton_call = torch.ops.mylib.cvmm_triton
     else:
         cvmm_triton_call = cvmm_triton
+    cvmm_triton_accumulate_call = cvmm_triton_accumulate
+    cvmm_triton_reduction_call = cvmm_triton_reduction
 
 # torch.library.define("mylib::cvmm_triton_backward", "(Tensor x, Tensor sel_index, Tensor sel, Tensor grads, int n_experts, ScalarType key_dtype, bool op_float16, Tensor out_index) -> Tensor")
 
@@ -463,7 +639,7 @@ def cvmm_triton_backward(
     sel = sel.flatten()
     M, _ = x.shape
     K, N = grads.shape
-    out = torch.zeros((n_experts, M, N), device=x.device, dtype=key_dtype)
+    out = torch.zeros((n_experts, M, N), device=x.device, dtype=torch.float32)
     grid = lambda META: (
         triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), triton.cdiv(K, META['BLOCK_SIZE_K'] * META['K_BLOCKS'])
     )
@@ -483,7 +659,7 @@ def cvmm_triton_backward(
         dtype_id=dtype_to_type_id(op_dtype),
         allow_tf32=False #torch.backends.cuda.matmul.allow_tf32
     )
-    return out
+    return out if key_dtype == torch.float32 else out.to(key_dtype)
 
 
 class CVMM(torch.autograd.Function):
@@ -493,19 +669,20 @@ class CVMM(torch.autograd.Function):
     def forward(
         ctx,
         x: torch.Tensor,
+        raw_sel: torch.Tensor,
         sel_index: torch.Tensor,
         sel: torch.Tensor,
         keys: torch.Tensor,
         out_index: Optional[torch.Tensor] = None,
         reduction_weight: Optional[torch.Tensor] = None
     ):
-        ctx.save_for_backward(x, keys, sel, sel_index, out_index, reduction_weight)
+        ctx.save_for_backward(x, keys, raw_sel, sel, sel_index, out_index, reduction_weight)
 
         out_type = get_dtype()
         if out_index is None:
             out_index = torch.tensor(-1, device=x.device)
 
-        res = cvmm_triton_call(x, sel_index, sel, keys, out_type, out_index)
+        res = cvmm_triton_call(x, sel_index, sel, keys, out_type, out_index, out_type)
 
         if reduction_weight is not None:
             res = res.view(*reduction_weight.shape, res.shape[-1])
@@ -518,12 +695,12 @@ class CVMM(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        x, keys, sel, sel_index, out_index, reduction_weight = ctx.saved_tensors
+        x, keys, raw_sel, sel, sel_index, out_index, reduction_weight = ctx.saved_tensors
         keys_dt = keys
 
         need_grad_x = ctx.needs_input_grad[0]
-        need_grad_keys = ctx.needs_input_grad[3]
-        need_grad_reduction_weight = ctx.needs_input_grad[5] and reduction_weight is not None
+        need_grad_keys = ctx.needs_input_grad[4]
+        need_grad_reduction_weight = ctx.needs_input_grad[6] and reduction_weight is not None
 
         out_index_is_none = False
         if out_index is None:
@@ -560,30 +737,63 @@ class CVMM(torch.autograd.Function):
                 bw_index_out = bw_index
                 bw_index = bw_index // reduction_weight.shape[-1]
 
-            grad_x_full = cvmm_triton_call(
-                grad_output,
-                bw_index,
-                sel,
-                keys_dt.transpose(1, 2),
-                ctx.op_type,
-                bw_index_out
-            )
+            top_k = raw_sel.shape[-1] if raw_sel.ndim > 0 else 1
+            can_reduce_routes = reduction_weight is None and need_grad_x and not out_index_is_none and top_k > 1
+            grad_x_elements = x.numel()
+            use_atomic_reduction = can_reduce_routes and grad_x_elements <= 16 * 1024 * 1024
+            use_route_accumulation = can_reduce_routes and not use_atomic_reduction and x.shape[-1] <= 128
 
-            grad_x_full = grad_x_full.view(*x.shape[:-1], -1, x.shape[-1])
-            if reduction_weight is not None:
-                if need_grad_x:
-                    grad_x = (reduction_weight.view(*grad_x_full.shape[:-1]).unsqueeze(-2).type_as(grad_x_full) @ grad_x_full).squeeze(-2)
-                if need_grad_reduction_weight:
-                    grad_w_off = (grad_x_full.type_as(reduction_weight) @ x.unsqueeze(-1).type_as(reduction_weight)).squeeze(-1).view_as(reduction_weight)
-            elif need_grad_x and grad_x_full.shape[-2] != 1:
-                grad_x = grad_x_full.sum(-2)
-            elif need_grad_x:
-                grad_x = grad_x_full
+            if use_atomic_reduction:
+                grad_x = cvmm_triton_reduction_call(
+                    grad_output,
+                    bw_index,
+                    sel,
+                    keys_dt.transpose(1, 2),
+                    ctx.op_type,
+                    x.dtype,
+                    top_k
+                )
+            elif use_route_accumulation:
+                route_sel, route_sel_index = raw_sel.reshape(-1, top_k).transpose(0, 1).sort(dim=1)
+                grad_output_routes = grad_output.flatten(end_dim=-3)
+                grad_x = torch.empty((grad_output_routes.shape[0], x.shape[-1]), device=x.device, dtype=x.dtype)
+                keys_t = keys_dt.transpose(1, 2)
+                for route in range(route_sel.shape[0]):
+                    cvmm_triton_accumulate_call(
+                        grad_output_routes[:, route, :],
+                        route_sel_index[route],
+                        route_sel[route],
+                        keys_t,
+                        grad_x,
+                        ctx.op_type,
+                        route != 0
+                    )
+            else:
+                grad_x_full = cvmm_triton_call(
+                    grad_output,
+                    bw_index,
+                    sel,
+                    keys_dt.transpose(1, 2),
+                    x.dtype if reduction_weight is None else ctx.op_type,
+                    bw_index_out,
+                    ctx.op_type
+                )
+
+                grad_x_full = grad_x_full.view(*x.shape[:-1], -1, x.shape[-1])
+                if reduction_weight is not None:
+                    if need_grad_x:
+                        grad_x = (reduction_weight.view(*grad_x_full.shape[:-1]).unsqueeze(-2).type_as(grad_x_full) @ grad_x_full).squeeze(-2)
+                    if need_grad_reduction_weight:
+                        grad_w_off = (grad_x_full.type_as(reduction_weight) @ x.unsqueeze(-1).type_as(reduction_weight)).squeeze(-1).view_as(reduction_weight)
+                elif need_grad_x and grad_x_full.shape[-2] != 1:
+                    grad_x = grad_x_full.sum(-2)
+                elif need_grad_x:
+                    grad_x = grad_x_full
 
             if grad_x is not None:
-                grad_x = grad_x.view_as(x)
+                grad_x = grad_x.to(x.dtype).view_as(x)
 
-        return grad_x, None, None, grad_w, None, grad_w_off
+        return grad_x, None, None, None, grad_w, None, grad_w_off
 
 known_shapes = set()
 
@@ -611,7 +821,7 @@ def cvmm(x: torch.Tensor, sel: Union[torch.Tensor, CVMMSel], keys: torch.Tensor)
         print("New shape:", sh)
         known_shapes.add(sh)
 
-    return CVMM.apply(x, sel.sel_index, sel.sel, keys, sel.out_index, sel.reduction_weight)
+    return CVMM.apply(x, sel.raw_sel, sel.sel_index, sel.sel, keys, sel.out_index, sel.reduction_weight)
 
 
 def cvmm_prepare_sel2(sel: torch.Tensor, w: Optional[torch.Tensor] = None) -> CVMMSel:
