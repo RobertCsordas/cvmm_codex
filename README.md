@@ -24,18 +24,18 @@ than the dense-equivalent probe for that shape.
 
 | Shape | sel ms | fw ms | bw ms | total ms | vs original | vs dense |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `ff_up_1024` | 0.508 | 1.235 | 2.817 | 4.560 | 1.85x | 2.68x |
-| `ff_down_1024_weighted` | 0.356 | 2.049 | 2.505 | 4.911 | 2.57x | 1.00x |
-| `ff_up_2048` | 0.472 | 1.655 | 3.314 | 5.441 | 1.99x | 3.05x |
-| `ff_down_2048_weighted` | 0.382 | 2.238 | 2.988 | 5.608 | 2.46x | 1.15x |
-| `switch_v_1024` | 0.373 | 1.441 | 6.508 | 8.321 | 1.38x | 2.00x |
-| `switch_o_1024_weighted` | 0.285 | 4.141 | 3.873 | 8.300 | 1.96x | 0.92x |
-| `switch_v_2048_h32` | 0.326 | 2.664 | 11.139 | 14.129 | 1.63x | 1.82x |
-| `switch_o_2048_h32_weighted` | 0.289 | 7.109 | 7.345 | 14.743 | 1.68x | 1.03x |
-| `ff_up_768` | 0.500 | 0.817 | 1.732 | 3.050 | 1.48x | 2.46x |
-| `switch_o_768_weighted` | 0.442 | 1.877 | 1.840 | 4.160 | 1.86x | 1.18x |
-| `ff_up_4096_stress` | 0.417 | 1.880 | 3.661 | 5.958 | 2.29x | 5.56x |
-| `ff_down_4096_weighted_stress` | 0.337 | 2.174 | 3.406 | 5.916 | 2.54x | 2.13x |
+| `ff_up_1024` | 0.427 | 1.230 | 2.666 | 4.322 | 1.93x | 2.58x |
+| `ff_down_1024_weighted` | 0.370 | 2.073 | 2.601 | 5.044 | 2.50x | 1.02x |
+| `ff_up_2048` | 0.406 | 1.610 | 3.039 | 5.055 | 2.13x | 2.86x |
+| `ff_down_2048_weighted` | 0.347 | 2.184 | 2.913 | 5.445 | 2.53x | 1.12x |
+| `switch_v_1024` | 0.337 | 1.427 | 5.836 | 7.600 | 1.51x | 1.82x |
+| `switch_o_1024_weighted` | 0.292 | 4.263 | 3.879 | 8.434 | 1.93x | 0.93x |
+| `switch_v_2048_h32` | 0.267 | 2.641 | 11.154 | 14.062 | 1.63x | 1.82x |
+| `switch_o_2048_h32_weighted` | 0.256 | 7.074 | 7.286 | 14.616 | 1.69x | 1.03x |
+| `ff_up_768` | 0.420 | 0.789 | 1.692 | 2.901 | 1.53x | 2.40x |
+| `switch_o_768_weighted` | 0.377 | 1.796 | 1.803 | 3.977 | 1.92x | 1.14x |
+| `ff_up_4096_stress` | 0.381 | 1.898 | 3.652 | 5.931 | 2.29x | 5.57x |
+| `ff_down_4096_weighted_stress` | 0.300 | 2.192 | 3.348 | 5.840 | 2.55x | 2.12x |
 
 The weighted down/O projections are now close to the dense-equivalent bound on
 the main 1024-2048 shapes. The remaining large gap is mostly in the unweighted
