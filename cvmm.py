@@ -21,9 +21,9 @@ class CVMMSel:
 
 
 def cvmm_prepare_sel(sel: torch.Tensor, n_experts: int) -> CVMMSel:
-    fsel = sel.flatten()
+    fsel = sel.flatten().to(torch.int32)
     ssel, sel_index = fsel.sort()
-    return CVMMSel(sel, ssel.view_as(sel), sel_index, None)
+    return CVMMSel(sel.to(torch.int32), ssel.view_as(sel), sel_index, None)
 
 
 def get_dtype():
@@ -852,10 +852,10 @@ def cvmm_prepare_sel2(sel: torch.Tensor, w: Optional[torch.Tensor] = None) -> CV
     # indices = torch.arange(sel.nelement() // n_per_batch, device=sel.device, dtype=torch.int32)
     # indices = indices.repeat_interleave(n_per_batch).flatten()
 
-    fsel = sel.flatten()
+    fsel = sel.flatten().to(torch.int32)
     ssel, sel_index = fsel.sort()
 
     # in_index = indices[sel_index]
     in_index = sel_index // n_per_batch
 
-    return CVMMSel(sel, ssel.view_as(sel), in_index, sel_index, w)
+    return CVMMSel(sel.to(torch.int32), ssel.view_as(sel), in_index, sel_index, w)
