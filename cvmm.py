@@ -52,6 +52,7 @@ cvmm_group_routes_call = None
 cvmm_grouped_backward_call = None
 cvmm_grouped_backward_lowmem_call = None
 cvmm_grouped_backward_weighted_w_call = None
+cvmm_weighted_route_bwd_x_call = None
 cvmm_reduction_tuned_shapes = set()
 cvmm_use_lowmem_grouped_backward = os.environ.get("CVMM_DISABLE_LOWMEM_GROUPED_BACKWARD", "0").lower() not in ("1", "true", "yes", "on")
 cvmm_lowmem_min_top_k = int(os.environ.get("CVMM_LOWMEM_MIN_TOP_K", "32"))
@@ -75,7 +76,7 @@ def _cvmm_lowmem_chunk_size(top_k: int) -> int:
     return min(top_k, chunk_size)
 
 def create_kernels():
-    global cvmm_backward_kernel3, cvmm_triton_call, cvmm_triton_into_call, cvmm_triton_accumulate_call, cvmm_triton_reduction_call, cvmm_group_routes_call, cvmm_grouped_backward_call, cvmm_grouped_backward_lowmem_call, cvmm_grouped_backward_weighted_w_call
+    global cvmm_backward_kernel3, cvmm_triton_call, cvmm_triton_into_call, cvmm_triton_accumulate_call, cvmm_triton_reduction_call, cvmm_group_routes_call, cvmm_grouped_backward_call, cvmm_grouped_backward_lowmem_call, cvmm_grouped_backward_weighted_w_call, cvmm_weighted_route_bwd_x_call
 
     if cvmm_triton_call is not None:
         return
@@ -942,6 +943,106 @@ def create_kernels():
         return out.view(*sel_shape[:-1], N)
 
 
+    @triton.autotune(
+        configs=[
+            triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=4),
+            triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=4),
+            triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=4),
+            triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=4),
+            triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+            triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        ],
+        key=['M', 'N', 'K', 'dtype_id', 'out_dtype_id', 'NEED_GRAD_X', 'NEED_GRAD_WEIGHT', 'allow_tf32'],
+        reset_to_zero=['grad_weight_ptr']
+    )
+    @triton.jit
+    def cvmm_weighted_route_bwd_x_kernel(
+        grad_ptr, key_ptr, x_ptr, grad_x_ptr, grad_weight_ptr, route_index_ptr, sel_ptr, weight_ptr,
+        M, N, K,
+        stride_gt, stride_gk,
+        stride_ke, stride_kk, stride_kn,
+        stride_xr, stride_xn,
+        stride_gxr, stride_gxn,
+        stride_route_index, stride_sel, stride_weight, stride_grad_weight,
+        dtype_id: tl.constexpr, out_dtype_id: tl.constexpr, allow_tf32: tl.constexpr, REDUCE_SIZE: tl.constexpr,
+        NEED_GRAD_X: tl.constexpr, NEED_GRAD_WEIGHT: tl.constexpr,
+        BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+        GROUP_SIZE_M: tl.constexpr
+    ):
+        pid = tl.program_id(axis=0)
+
+        num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+        num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+        num_pid_in_group = GROUP_SIZE_M * num_pid_n
+        group_id = pid // num_pid_in_group
+        first_pid_m = group_id * GROUP_SIZE_M
+        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+        pid_n = (pid % num_pid_in_group) // group_size_m
+        pid_m = first_pid_m + (pid % group_size_m)
+
+        offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        route_ids = tl.load(route_index_ptr + (offs_m % M) * stride_route_index)
+        token_ids = route_ids // REDUCE_SIZE
+        route_weight = tl.load(weight_ptr + route_ids * stride_weight)
+        sel_first = tl.load(sel_ptr + pid_m * BLOCK_SIZE_M * stride_sel)
+        sel_last = tl.load(sel_ptr + (min((pid_m + 1) * BLOCK_SIZE_M, M) - 1) * stride_sel)
+        sel_all = tl.load(sel_ptr + stride_sel * (offs_m % M))
+
+        for expert in range(sel_first, sel_last + 1):
+            offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+            offs_k = tl.arange(0, BLOCK_SIZE_K)
+            grad_ptrs = grad_ptr + token_ids[:, None] * stride_gt + offs_k[None, :] * stride_gk
+            key_ptrs = key_ptr + expert * stride_ke + offs_k[:, None] * stride_kk + offs_n[None, :] * stride_kn
+
+            acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+            for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+                k_mask = offs_k < K - k * BLOCK_SIZE_K
+                g = tl.load(grad_ptrs, mask=k_mask[None, :], other=0.0)
+                w = tl.load(key_ptrs, mask=k_mask[:, None] & (offs_n[None, :] < N), other=0.0)
+                if dtype_id == 1:
+                    g = g.to(tl.float16)
+                    w = w.to(tl.float16)
+                elif dtype_id == 2:
+                    g = g.to(tl.bfloat16)
+                    w = w.to(tl.bfloat16)
+                acc += tl.dot(g, w, allow_tf32=allow_tf32)
+                grad_ptrs += BLOCK_SIZE_K * stride_gk
+                key_ptrs += BLOCK_SIZE_K * stride_kk
+
+            route_mask = (offs_m[:, None] < M) & (sel_all[:, None] == expert) & (offs_n[None, :] < N)
+            if NEED_GRAD_X:
+                if dtype_id == 1:
+                    weighted_grad = acc.to(tl.float16) * route_weight.to(tl.float16)[:, None]
+                elif dtype_id == 2:
+                    weighted_grad = acc.to(tl.bfloat16) * route_weight.to(tl.bfloat16)[:, None]
+                else:
+                    weighted_grad = acc * route_weight[:, None]
+
+                if out_dtype_id == 1:
+                    weighted_out = weighted_grad.to(tl.float16)
+                elif out_dtype_id == 2:
+                    weighted_out = weighted_grad.to(tl.bfloat16)
+                else:
+                    weighted_out = weighted_grad
+                gx_ptrs = grad_x_ptr + route_ids[:, None] * stride_gxr + offs_n[None, :] * stride_gxn
+                tl.store(gx_ptrs, weighted_out, mask=route_mask)
+
+            if NEED_GRAD_WEIGHT:
+                x_vals = tl.load(
+                    x_ptr + route_ids[:, None] * stride_xr + offs_n[None, :] * stride_xn,
+                    mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+                    other=0.0
+                )
+                if dtype_id == 1:
+                    gate_vals = acc.to(tl.float16).to(tl.float32) * x_vals.to(tl.float32)
+                elif dtype_id == 2:
+                    gate_vals = acc.to(tl.bfloat16).to(tl.float32) * x_vals.to(tl.float32)
+                else:
+                    gate_vals = acc * x_vals.to(tl.float32)
+                gate_part = tl.sum(tl.where(route_mask, gate_vals, 0.0), axis=1)
+                tl.atomic_add(grad_weight_ptr + route_ids * stride_grad_weight, gate_part, mask=offs_m < M)
+
+
     def cvmm_group_routes(src: torch.Tensor, route_index: torch.Tensor, fan_out: int):
         src = src.flatten(end_dim=-2)
         route_index = route_index.flatten()
@@ -1168,6 +1269,56 @@ def create_kernels():
         return grad_w if key_dtype == torch.float32 else grad_w.to(key_dtype)
 
 
+    def cvmm_weighted_route_bwd_x(
+        x: torch.Tensor,
+        sel_index: torch.Tensor,
+        sel: torch.Tensor,
+        grads: torch.Tensor,
+        keys: torch.Tensor,
+        reduction_weight: torch.Tensor,
+        op_dtype: torch.dtype,
+        need_grad_x: bool,
+        need_grad_weight: bool,
+    ):
+        x_flat = x.flatten(end_dim=-2)
+        grads_flat = grads.flatten(end_dim=-2)
+        keys_t = keys.transpose(1, 2)
+        sel_flat = sel.flatten()
+        route_index = sel_index.flatten()
+        reduction_weight_flat = reduction_weight.flatten()
+        total_routes = sel_flat.numel()
+        assert x_flat.shape[0] == total_routes
+        assert route_index.numel() == total_routes
+        assert reduction_weight_flat.numel() == total_routes
+
+        M = total_routes
+        N = x_flat.shape[-1]
+        K = grads_flat.shape[-1]
+        grad_x = torch.empty_like(x_flat) if need_grad_x else x_flat.new_empty((1, 1))
+        grad_weight = torch.zeros((M,), device=x.device, dtype=torch.float32) if need_grad_weight else x_flat.new_empty((1,), dtype=torch.float32)
+        grid = lambda META: (
+            triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']),
+        )
+        cvmm_weighted_route_bwd_x_kernel[grid](
+            grads_flat, keys_t, x_flat, grad_x, grad_weight, route_index, sel_flat, reduction_weight_flat,
+            M, N, K,
+            grads_flat.stride(0), grads_flat.stride(1),
+            keys_t.stride(0), keys_t.stride(1), keys_t.stride(2),
+            x_flat.stride(0), x_flat.stride(1),
+            grad_x.stride(0), grad_x.stride(1),
+            route_index.stride(0), sel_flat.stride(0), reduction_weight_flat.stride(0), grad_weight.stride(0),
+            dtype_id=dtype_to_type_id(op_dtype),
+            out_dtype_id=dtype_to_type_id(x.dtype),
+            allow_tf32=False, #torch.backends.cuda.matmul.allow_tf32
+            REDUCE_SIZE=reduction_weight.shape[-1],
+            NEED_GRAD_X=need_grad_x,
+            NEED_GRAD_WEIGHT=need_grad_weight,
+        )
+        grad_x_out = grad_x.view_as(x) if need_grad_x else None
+        grad_weight_out = grad_weight.view_as(reduction_weight).to(reduction_weight.dtype) if need_grad_weight else None
+        return grad_x_out, grad_weight_out
+
+
     if version.parse(torch.__version__) >= version.parse("2.2.0"):
         if version.parse(triton.__version__) >= version.parse("3.0.0"):
             decorator = torch.library.register_fake
@@ -1196,6 +1347,7 @@ def create_kernels():
     cvmm_grouped_backward_call = cvmm_grouped_backward
     cvmm_grouped_backward_lowmem_call = cvmm_grouped_backward_lowmem
     cvmm_grouped_backward_weighted_w_call = cvmm_grouped_backward_weighted_w
+    cvmm_weighted_route_bwd_x_call = cvmm_weighted_route_bwd_x
 
 # torch.library.define("mylib::cvmm_triton_backward", "(Tensor x, Tensor sel_index, Tensor sel, Tensor grads, int n_experts, ScalarType key_dtype, bool op_float16, Tensor out_index) -> Tensor")
 
@@ -1399,7 +1551,26 @@ class CVMM(torch.autograd.Function):
                 reduce_size=1 if reduction_weight is None else reduction_weight.shape[-1]
             )
 
-        if (need_grad_x or need_grad_reduction_weight) and grad_x is None:
+        need_weighted_x_work = (need_grad_x and grad_x is None) or (need_grad_reduction_weight and grad_w_off is None)
+        if need_weighted_x_work and reduction_weight is not None and out_index_is_none and x.shape[:-1] == reduction_weight.shape:
+            try:
+                grad_x, grad_w_off = cvmm_weighted_route_bwd_x_call(
+                    x,
+                    sel_index,
+                    sel,
+                    grad_output,
+                    keys_dt,
+                    reduction_weight,
+                    ctx.op_type,
+                    need_grad_x,
+                    need_grad_reduction_weight,
+                )
+            except torch.OutOfMemoryError:
+                grad_x = None
+                grad_w_off = None
+
+        need_weighted_x_work = (need_grad_x and grad_x is None) or (need_grad_reduction_weight and grad_w_off is None)
+        if need_weighted_x_work:
             bw_index = sel_index if out_index_is_none else out_index
             bw_index_out = torch.tensor(-1, device=x.device)
             if reduction_weight is not None:
