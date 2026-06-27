@@ -288,14 +288,14 @@ def create_kernels():
             triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 64}, num_stages=4, num_warps=4),
             triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 64}, num_stages=4, num_warps=4),
         ],
-        key=['M', 'N', 'K', 'out_dtype_id', 'allow_tf32', 'dtype_id'],
+        key=['M', 'N', 'K', 'out_dtype_id', 'allow_tf32', 'dtype_id', 'HAS_WEIGHT', 'REDUCE_SIZE'],
         prune_configs_by={"early_config_prune": _prune_backward_configs},
         reset_to_zero=['c_ptr']
     )
     @triton.jit
     def cvmm_backward_kernel3(
         # Pointers to matrices
-        a_ptr, b_ptr, c_ptr, index_ptr, sel_ptr, out_index_ptr,
+        a_ptr, b_ptr, c_ptr, index_ptr, sel_ptr, out_index_ptr, weight_ptr,
         # Matrix dimensions
         M, N, K,
         # The stride variables represent how much to increase the ptr by when moving by 1
@@ -304,9 +304,10 @@ def create_kernels():
         stride_am, stride_ak,
         stride_bk, stride_bn,
         stride_co, stride_cm, stride_cn,
-        stride_index, stride_sel, stride_out_index,
+        stride_index, stride_sel, stride_out_index, stride_weight,
         out_index_is_none: tl.constexpr,
         out_dtype_id: tl.constexpr, allow_tf32: tl.constexpr, dtype_id: tl.constexpr,
+        HAS_WEIGHT: tl.constexpr, REDUCE_SIZE: tl.constexpr,
         # Meta-parameters
         BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
         GROUP_SIZE_M: tl.constexpr, K_BLOCKS: tl.constexpr
@@ -406,9 +407,13 @@ def create_kernels():
                     block_mem_indices = block_mem_indices_f % K
                     a_index = tl.load(index_ptr + stride_index * block_mem_indices)
                     if out_index_is_none:
-                        b_index = a_index
+                        route_index = a_index
                     else:
-                        b_index = tl.load(out_index_ptr + stride_out_index * block_mem_indices)
+                        route_index = tl.load(out_index_ptr + stride_out_index * block_mem_indices)
+                    if HAS_WEIGHT:
+                        b_index = route_index // REDUCE_SIZE
+                    else:
+                        b_index = route_index
                     sel_ok = block_mem_indices_f < end_i
 
                     a_ptrs = a_ptrs_this + a_index[None, :] * stride_ak
@@ -425,6 +430,14 @@ def create_kernels():
                     elif dtype_id == 2:
                         a = a.to(tl.bfloat16)
                         b = b.to(tl.bfloat16)
+
+                    if HAS_WEIGHT:
+                        weights = tl.load(weight_ptr + route_index * stride_weight, mask=sel_ok, other=0.0)
+                        if dtype_id == 1:
+                            weights = weights.to(tl.float16)
+                        elif dtype_id == 2:
+                            weights = weights.to(tl.bfloat16)
+                        b *= weights[:, None]
 
                     # We accumulate along the K dimension.
                     accumulator += tl.dot(a, b, allow_tf32=allow_tf32)
@@ -631,14 +644,24 @@ def cvmm_triton_backward(
     n_experts: int,
     key_dtype: torch.dtype,
     op_dtype: torch.dtype,
-    out_index: torch.Tensor
+    out_index: torch.Tensor,
+    reduction_weight: Optional[torch.Tensor] = None,
+    reduce_size: int = 1
 ):
     x = x.flatten(end_dim=-2)
     x = x.transpose(0, 1)
     grads = grads.flatten(end_dim=-2)
     sel = sel.flatten()
     M, _ = x.shape
-    K, N = grads.shape
+    grad_rows, N = grads.shape
+    K = sel.shape[0]
+    has_weight = reduction_weight is not None
+    if not has_weight:
+        assert grad_rows == K
+        reduction_weight = grads.new_empty((1,))
+    else:
+        reduction_weight = reduction_weight.flatten()
+        assert reduction_weight.numel() == K
     out = torch.zeros((n_experts, M, N), device=x.device, dtype=torch.float32)
     grid = lambda META: (
         triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), triton.cdiv(K, META['BLOCK_SIZE_K'] * META['K_BLOCKS'])
@@ -648,15 +671,17 @@ def cvmm_triton_backward(
         out_index_is_none = True
 
     cvmm_backward_kernel3[grid](
-        x, grads, out, sel_index, sel, out_index,
+        x, grads, out, sel_index, sel, out_index, reduction_weight,
         M, N, K,
         x.stride(0), x.stride(1),
         grads.stride(0), grads.stride(1),
         out.stride(0), out.stride(1), out.stride(2),
-        sel_index.stride(0), sel.stride(0), 0 if out_index_is_none else out_index.stride(0),
+        sel_index.stride(0), sel.stride(0), 0 if out_index_is_none else out_index.stride(0), reduction_weight.stride(0),
         out_index_is_none=out_index_is_none,
         out_dtype_id=dtype_to_type_id(out.dtype),
         dtype_id=dtype_to_type_id(op_dtype),
+        HAS_WEIGHT=has_weight,
+        REDUCE_SIZE=reduce_size,
         allow_tf32=False #torch.backends.cuda.matmul.allow_tf32
     )
     return out if key_dtype == torch.float32 else out.to(key_dtype)
@@ -710,21 +735,17 @@ class CVMM(torch.autograd.Function):
         grad_w = None
         if need_grad_keys:
             # Backward for weight
-            if reduction_weight is not None:
-                # Project back the grads with the reduction weight, so the grad for the weight matrix is ok.
-                grad_output_w = reduction_weight.unsqueeze(-1).type_as(grad_output) @ grad_output.unsqueeze(-2)
-            else:
-                grad_output_w = grad_output
-
             grad_w = cvmm_triton_backward(
                 x,
                 sel_index,
                 sel,
-                grad_output_w,
+                grad_output,
                 keys_dt.shape[0],
                 ctx.keys_type,
                 ctx.dtype,
-                out_index=out_index
+                out_index=out_index,
+                reduction_weight=reduction_weight,
+                reduce_size=1 if reduction_weight is None else reduction_weight.shape[-1]
             )
 
         grad_x = None
