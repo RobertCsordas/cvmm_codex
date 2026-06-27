@@ -19,6 +19,7 @@ for i in range(torch.cuda.device_count()):
         triton.testing.do_bench = do_bench
         break
 
+
 B, T, N = 512, 1024, 1024
 E=128
 K=16
@@ -27,7 +28,7 @@ device = 'cuda'
 
 test_data = torch.randn(B, T, N, dtype=torch.bfloat16, device=device, requires_grad=True)
 w = torch.randn(N_E, N, E, dtype=torch.float32, device=device, requires_grad=True)
-sel = torch.randn(B, T, N_E, dtype=torch.bfloat16, device=device).argsort(dim=-1, descending=True)[..., :K]
+sel = torch.randn(B, T, N_E, dtype=torch.bfloat16, device=device).topk(K, dim=-1).indices
 
 print(sel.min().item(), sel.max().item())
 sel2 = cvmm_prepare_sel2(sel)

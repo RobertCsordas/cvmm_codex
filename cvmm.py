@@ -117,7 +117,7 @@ def create_kernels():
             # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
             # See above `Pointer Arithmetics` section for details
             offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-            offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+            offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
 
             remap_offs_am = tl.load(index_ptr + stride_index * offs_am)
 
@@ -136,7 +136,7 @@ def create_kernels():
                 # Load the next block of A and B, generate a mask by checking the K dimension.
                 # If it is out of bounds, set it to 0.
                 a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
-                b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+                b = tl.load(b_ptrs, mask=(offs_k[:, None] < K - k * BLOCK_SIZE_K) & (offs_bn[None, :] < N), other=0.0)
                 # We accumulate along the K dimension.
 
                 # Triton was unhappy with passing dtypes as vars.
@@ -180,18 +180,12 @@ def create_kernels():
         configs=[
             triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 64}, num_stages=4, num_warps=4),
             # triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 128}, num_stages=4, num_warps=4),
-            triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 32}, num_stages=4, num_warps=4),
 
             triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 64}, num_stages=4, num_warps=4),
             # triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 128}, num_stages=4, num_warps=4),
-            triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 32}, num_stages=4, num_warps=4),
 
-            triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 16}, num_stages=4, num_warps=4),
-            triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 16}, num_stages=4, num_warps=4),
             triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 64}, num_stages=4, num_warps=4),
             triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 64}, num_stages=4, num_warps=4),
-            triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 32}, num_stages=4, num_warps=4),
-            triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 16, 'GROUP_SIZE_M': 8, 'K_BLOCKS': 32}, num_stages=4, num_warps=4),
         ],
         key=['M', 'N', 'K', 'out_dtype_id', 'allow_tf32', 'dtype_id'], reset_to_zero = ['c_ptr']
     )
@@ -501,60 +495,67 @@ class CVMM(torch.autograd.Function):
         x, keys, sel, sel_index, out_index, reduction_weight = ctx.saved_tensors
         keys_dt = keys
 
-        # Backward for weight
-        if reduction_weight is not None:
-            # Project back the grads with he reduction weight, so the grad for the weight matrix is ok
-            grad_output_w = reduction_weight.unsqueeze(-1).type_as(grad_output) @ grad_output.unsqueeze(-2)
-        else:
-            grad_output_w  = grad_output
+        need_grad_x = ctx.needs_input_grad[0]
+        need_grad_keys = ctx.needs_input_grad[3]
+        need_grad_reduction_weight = ctx.needs_input_grad[5] and reduction_weight is not None
 
         out_index_is_none = False
         if out_index is None:
             out_index_is_none = True
             out_index = torch.tensor(-1, device=x.device)
 
-        grad_w = cvmm_triton_backward(
-            x,
-            sel_index,
-            sel,
-            grad_output_w,
-            keys_dt.shape[0],
-            ctx.keys_type,
-            ctx.dtype,
-            out_index=out_index
-        )
+        grad_w = None
+        if need_grad_keys:
+            # Backward for weight
+            if reduction_weight is not None:
+                # Project back the grads with the reduction weight, so the grad for the weight matrix is ok.
+                grad_output_w = reduction_weight.unsqueeze(-1).type_as(grad_output) @ grad_output.unsqueeze(-2)
+            else:
+                grad_output_w = grad_output
 
-        # Backward for input and reduction weight
+            grad_w = cvmm_triton_backward(
+                x,
+                sel_index,
+                sel,
+                grad_output_w,
+                keys_dt.shape[0],
+                ctx.keys_type,
+                ctx.dtype,
+                out_index=out_index
+            )
+
+        grad_x = None
         grad_w_off = None
+        if need_grad_x or need_grad_reduction_weight:
+            bw_index = sel_index if out_index_is_none else out_index
+            bw_index_out = torch.tensor(-1, device=x.device)
+            if reduction_weight is not None:
+                # Hack the output indices to emulate repeats.
+                bw_index_out = bw_index
+                bw_index = bw_index // reduction_weight.shape[-1]
 
-        bw_index = sel_index if out_index_is_none else out_index
-        bw_index_out = torch.tensor(-1, device=x.device)
-        if reduction_weight is not None:
-            # Hack the output indices to emulate repeats
-            bw_index_out = bw_index
-            bw_index = bw_index // reduction_weight.shape[-1]
+            grad_x_full = cvmm_triton_call(
+                grad_output,
+                bw_index,
+                sel,
+                keys_dt.transpose(1, 2),
+                ctx.op_type,
+                bw_index_out
+            )
 
-        grad_x_full = cvmm_triton_call(
-            grad_output,
-            bw_index,
-            sel,
-            keys_dt.transpose(1,2),
-            ctx.op_type,
-            bw_index_out
-        )
+            grad_x_full = grad_x_full.view(*x.shape[:-1], -1, x.shape[-1])
+            if reduction_weight is not None:
+                if need_grad_x:
+                    grad_x = (reduction_weight.view(*grad_x_full.shape[:-1]).unsqueeze(-2).type_as(grad_x_full) @ grad_x_full).squeeze(-2)
+                if need_grad_reduction_weight:
+                    grad_w_off = (grad_x_full.type_as(reduction_weight) @ x.unsqueeze(-1).type_as(reduction_weight)).squeeze(-1).view_as(reduction_weight)
+            elif need_grad_x and grad_x_full.shape[-2] != 1:
+                grad_x = grad_x_full.sum(-2)
+            elif need_grad_x:
+                grad_x = grad_x_full
 
-        grad_x_full = grad_x_full.view(*x.shape[:-1], -1, x.shape[-1])
-        if reduction_weight is not None:
-            # grad_x_full is the unscaled grad. For the input, we have to scale it, for the reduction wegiht,
-            # we have to compute dot products with the input.
-            grad_x = (reduction_weight.view(*grad_x_full.shape[:-1]).unsqueeze(-2).type_as(grad_x_full) @ grad_x_full).squeeze(-2)
-            grad_w_off = (grad_x_full.type_as(reduction_weight) @ x.unsqueeze(-1).type_as(reduction_weight)).squeeze(-1).view_as(reduction_weight)
-        elif grad_x_full.shape[-2] != 1:
-            grad_x = grad_x_full.sum(-2)
-        else:
-            grad_x = grad_x_full
-
-        grad_x = grad_x.view_as(x)
+            if grad_x is not None:
+                grad_x = grad_x.view_as(x)
 
         return grad_x, None, None, grad_w, None, grad_w_off
 
