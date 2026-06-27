@@ -44,12 +44,15 @@ def dtype_to_type_id(dtype: torch.dtype):
 
 
 cvmm_triton_call = None
+cvmm_triton_into_call = None
 cvmm_triton_accumulate_call = None
 cvmm_triton_reduction_call = None
+cvmm_group_routes_call = None
+cvmm_grouped_backward_call = None
 cvmm_reduction_tuned_shapes = set()
 
 def create_kernels():
-    global cvmm_backward_kernel3, cvmm_triton_call, cvmm_triton_accumulate_call, cvmm_triton_reduction_call
+    global cvmm_backward_kernel3, cvmm_triton_call, cvmm_triton_into_call, cvmm_triton_accumulate_call, cvmm_triton_reduction_call, cvmm_group_routes_call, cvmm_grouped_backward_call
 
     if cvmm_triton_call is not None:
         return
@@ -256,6 +259,88 @@ def create_kernels():
             c_ptrs = c_ptr + stride_cm * remap_offs_cm[:, None] + stride_cn * offs_cn[None, :]
             c_mask = ((offs_cm[:, None] < M) & (sel_all[:, None] == matrix_id)) & (offs_cn[None, :] < N)
             tl.atomic_add(c_ptrs, accumulator, mask=c_mask)
+
+
+    @triton.jit
+    def cvmm_group_routes_kernel(
+        src_ptr, index_ptr, out_ptr,
+        N_ROUTES: tl.constexpr, D: tl.constexpr, FAN_OUT: tl.constexpr,
+        stride_src_m, stride_src_d, stride_index, stride_out_m, stride_out_d,
+        BLOCK_ROUTES: tl.constexpr, BLOCK_D: tl.constexpr
+    ):
+        pid_m = tl.program_id(0)
+        pid_d = tl.program_id(1)
+        offs_m = pid_m * BLOCK_ROUTES + tl.arange(0, BLOCK_ROUTES)
+        offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+        route_idx = tl.load(index_ptr + offs_m * stride_index, mask=offs_m < N_ROUTES, other=0)
+        src_idx = route_idx // FAN_OUT
+        vals = tl.load(
+            src_ptr + src_idx[:, None] * stride_src_m + offs_d[None, :] * stride_src_d,
+            mask=(offs_m[:, None] < N_ROUTES) & (offs_d[None, :] < D),
+            other=0.0
+        )
+        tl.store(
+            out_ptr + offs_m[:, None] * stride_out_m + offs_d[None, :] * stride_out_d,
+            vals,
+            mask=(offs_m[:, None] < N_ROUTES) & (offs_d[None, :] < D)
+        )
+
+
+    @triton.autotune(
+        configs=[
+            triton.Config({'BLOCK_ROUTES': 32, 'BLOCK_M': 128, 'BLOCK_N': 128}, num_stages=4, num_warps=4),
+            triton.Config({'BLOCK_ROUTES': 32, 'BLOCK_M': 128, 'BLOCK_N': 64}, num_stages=4, num_warps=4),
+            triton.Config({'BLOCK_ROUTES': 32, 'BLOCK_M': 64, 'BLOCK_N': 128}, num_stages=4, num_warps=4),
+            triton.Config({'BLOCK_ROUTES': 64, 'BLOCK_M': 64, 'BLOCK_N': 64}, num_stages=4, num_warps=4),
+        ],
+        key=['M', 'N', 'TOTAL_ROUTES', 'dtype_id', 'allow_tf32']
+    )
+    @triton.jit
+    def cvmm_grouped_bwd_w_kernel(
+        x_ptr, grad_ptr, out_ptr, offsets_ptr,
+        M: tl.constexpr, N: tl.constexpr, TOTAL_ROUTES: tl.constexpr,
+        stride_xr, stride_xm,
+        stride_gr, stride_gn,
+        stride_oe, stride_om, stride_on,
+        dtype_id: tl.constexpr, allow_tf32: tl.constexpr,
+        BLOCK_ROUTES: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr
+    ):
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+        expert = tl.program_id(2)
+
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        zero = tl.full((), 0, dtype=tl.int64)
+        start = tl.load(offsets_ptr + expert - 1) if expert > 0 else zero
+        end = tl.load(offsets_ptr + expert)
+
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        route_start = start
+        while route_start < end:
+            offs_r = route_start + tl.arange(0, BLOCK_ROUTES)
+            route_mask = offs_r < end
+            x = tl.load(
+                x_ptr + offs_r[None, :] * stride_xr + offs_m[:, None] * stride_xm,
+                mask=route_mask[None, :] & (offs_m[:, None] < M),
+                other=0.0
+            )
+            g = tl.load(
+                grad_ptr + offs_r[:, None] * stride_gr + offs_n[None, :] * stride_gn,
+                mask=route_mask[:, None] & (offs_n[None, :] < N),
+                other=0.0
+            )
+            if dtype_id == 1:
+                x = x.to(tl.float16)
+                g = g.to(tl.float16)
+            elif dtype_id == 2:
+                x = x.to(tl.bfloat16)
+                g = g.to(tl.bfloat16)
+            acc += tl.dot(x, g, allow_tf32=allow_tf32)
+            route_start += BLOCK_ROUTES
+
+        out_ptrs = out_ptr + expert * stride_oe + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
+        tl.store(out_ptrs, acc, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
 
 
     def _prune_backward_configs(configs, named_args, **kwargs):
@@ -516,6 +601,45 @@ def create_kernels():
         return out.view(*sel_shape, N)
 
 
+    def cvmm_triton_into(
+        x: torch.Tensor,
+        sel_index: torch.Tensor,
+        sel: torch.Tensor,
+        keys: torch.Tensor,
+        out: torch.Tensor,
+        out_index: torch.Tensor,
+        op_dtype: torch.dtype
+    ):
+        x = x.flatten(end_dim=-2)
+        assert x.shape[-1] == keys.shape[1]
+        sel = sel.flatten()
+        M = sel.shape[0]
+        O, K, N = keys.shape
+        assert out.shape == (M, N)
+
+        grid = lambda META: (
+            triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']),
+        )
+
+        out_index_is_none = False
+        if out_index.numel() == 1 and out_index == -1:
+            out_index_is_none = True
+
+        cvmm_kernel[grid](
+            x, keys, out, sel_index, sel, out_index,
+            M, N, K,
+            x.stride(0), x.stride(1),
+            keys.stride(0), keys.stride(1), keys.stride(2),
+            out.stride(0), out.stride(1),
+            sel_index.stride(0), sel.stride(0), 0 if out_index_is_none else out_index.stride(0),
+            out_index_is_none=out_index_is_none,
+            dtype_id=dtype_to_type_id(op_dtype),
+            out_dtype_id=dtype_to_type_id(out.dtype),
+            allow_tf32=False, #torch.backends.cuda.matmul.allow_tf32
+            ACCUMULATE_OUTPUT=False,
+        )
+
+
     def cvmm_triton_accumulate(
         x: torch.Tensor,
         sel_index: torch.Tensor,
@@ -609,6 +733,89 @@ def create_kernels():
         return out.view(*sel_shape[:-1], N)
 
 
+    def cvmm_group_routes(src: torch.Tensor, route_index: torch.Tensor, fan_out: int):
+        src = src.flatten(end_dim=-2)
+        route_index = route_index.flatten()
+        n_routes = route_index.numel()
+        d = src.shape[-1]
+        out = torch.empty((n_routes, d), device=src.device, dtype=src.dtype)
+        grid = (triton.cdiv(n_routes, 256), triton.cdiv(d, 128))
+        cvmm_group_routes_kernel[grid](
+            src, route_index, out,
+            N_ROUTES=n_routes, D=d, FAN_OUT=fan_out,
+            stride_src_m=src.stride(0), stride_src_d=src.stride(1),
+            stride_index=route_index.stride(0),
+            stride_out_m=out.stride(0), stride_out_d=out.stride(1),
+            BLOCK_ROUTES=256, BLOCK_D=128,
+        )
+        return out
+
+
+    def cvmm_grouped_backward(
+        x: torch.Tensor,
+        sel_index: torch.Tensor,
+        sel: torch.Tensor,
+        grads: torch.Tensor,
+        keys: torch.Tensor,
+        n_experts: int,
+        key_dtype: torch.dtype,
+        op_dtype: torch.dtype,
+        top_k: int,
+        need_grad_x: bool,
+        need_grad_w: bool
+    ):
+        x_flat = x.flatten(end_dim=-2)
+        grads_flat = grads.flatten(end_dim=-2)
+        sel_flat = sel.flatten()
+        total_routes = sel_flat.numel()
+        assert total_routes == grads_flat.shape[0]
+
+        offsets = torch.bincount(sel_flat.to(torch.int64), minlength=n_experts).cumsum(0)
+        grouped_grads = cvmm_group_routes(grads_flat, sel_index, 1)
+
+        grouped_x = None
+        grad_w = None
+        if need_grad_w:
+            grouped_x = cvmm_group_routes(x_flat, sel_index, top_k)
+            M = x_flat.shape[-1]
+            N = grads_flat.shape[-1]
+            grad_w = torch.empty((n_experts, M, N), device=x.device, dtype=torch.float32)
+            grid = lambda META: (
+                triton.cdiv(M, META['BLOCK_M']),
+                triton.cdiv(N, META['BLOCK_N']),
+                n_experts,
+            )
+            cvmm_grouped_bwd_w_kernel[grid](
+                grouped_x, grouped_grads, grad_w, offsets,
+                M, N, total_routes,
+                grouped_x.stride(0), grouped_x.stride(1),
+                grouped_grads.stride(0), grouped_grads.stride(1),
+                grad_w.stride(0), grad_w.stride(1), grad_w.stride(2),
+                dtype_id=dtype_to_type_id(op_dtype),
+                allow_tf32=False, #torch.backends.cuda.matmul.allow_tf32
+            )
+            if key_dtype != torch.float32:
+                grad_w = grad_w.to(key_dtype)
+
+        grad_x = None
+        if need_grad_x:
+            if grouped_x is None:
+                grouped_x = torch.empty((total_routes, x_flat.shape[-1]), device=x.device, dtype=x.dtype)
+            sorted_positions = torch.arange(total_routes, device=x.device, dtype=sel_index.dtype)
+            cvmm_triton_into(
+                grouped_grads,
+                sorted_positions,
+                sel_flat,
+                keys.transpose(1, 2),
+                grouped_x,
+                sel_index,
+                op_dtype,
+            )
+            grad_x = grouped_x.view(*x.shape[:-1], top_k, x.shape[-1]).sum(-2).to(x.dtype).view_as(x)
+
+        return grad_x, grad_w
+
+
     if version.parse(torch.__version__) >= version.parse("2.2.0"):
         if version.parse(triton.__version__) >= version.parse("3.0.0"):
             decorator = torch.library.register_fake
@@ -630,8 +837,11 @@ def create_kernels():
         cvmm_triton_call = torch.ops.mylib.cvmm_triton
     else:
         cvmm_triton_call = cvmm_triton
+    cvmm_triton_into_call = cvmm_triton_into
     cvmm_triton_accumulate_call = cvmm_triton_accumulate
     cvmm_triton_reduction_call = cvmm_triton_reduction
+    cvmm_group_routes_call = cvmm_group_routes
+    cvmm_grouped_backward_call = cvmm_grouped_backward
 
 # torch.library.define("mylib::cvmm_triton_backward", "(Tensor x, Tensor sel_index, Tensor sel, Tensor grads, int n_experts, ScalarType key_dtype, bool op_float16, Tensor out_index) -> Tensor")
 
@@ -732,8 +942,43 @@ class CVMM(torch.autograd.Function):
             out_index_is_none = True
             out_index = torch.tensor(-1, device=x.device)
 
+        top_k = raw_sel.shape[-1] if raw_sel.ndim > 0 else 1
         grad_w = None
-        if need_grad_keys:
+        grad_x = None
+        grad_w_off = None
+
+        can_grouped_backward = (
+            reduction_weight is None and
+            not out_index_is_none and
+            top_k > 1 and
+            (need_grad_x or need_grad_keys)
+        )
+        if can_grouped_backward:
+            total_routes = sel.numel()
+            op_bytes = torch.finfo(ctx.op_type).bits // 8
+            grouped_bytes = total_routes * (x.shape[-1] + grad_output.shape[-1]) * op_bytes
+            if need_grad_keys:
+                grouped_bytes += keys_dt.numel() * torch.finfo(torch.float32).bits // 8
+            if need_grad_x:
+                grouped_bytes += total_routes * out_index.element_size()
+            can_grouped_backward = grouped_bytes <= 3 * 1024 * 1024 * 1024
+
+        if can_grouped_backward:
+            grad_x, grad_w = cvmm_grouped_backward_call(
+                x,
+                out_index,
+                sel,
+                grad_output,
+                keys_dt,
+                keys_dt.shape[0],
+                ctx.keys_type,
+                ctx.dtype,
+                top_k,
+                need_grad_x,
+                need_grad_keys
+            )
+
+        if need_grad_keys and grad_w is None:
             # Backward for weight
             grad_w = cvmm_triton_backward(
                 x,
@@ -748,9 +993,7 @@ class CVMM(torch.autograd.Function):
                 reduce_size=1 if reduction_weight is None else reduction_weight.shape[-1]
             )
 
-        grad_x = None
-        grad_w_off = None
-        if need_grad_x or need_grad_reduction_weight:
+        if (need_grad_x or need_grad_reduction_weight) and grad_x is None:
             bw_index = sel_index if out_index_is_none else out_index
             bw_index_out = torch.tensor(-1, device=x.device)
             if reduction_weight is not None:
@@ -758,7 +1001,6 @@ class CVMM(torch.autograd.Function):
                 bw_index_out = bw_index
                 bw_index = bw_index // reduction_weight.shape[-1]
 
-            top_k = raw_sel.shape[-1] if raw_sel.ndim > 0 else 1
             can_reduce_routes = reduction_weight is None and need_grad_x and not out_index_is_none and top_k > 1
             grad_x_elements = x.numel()
             use_atomic_reduction = can_reduce_routes and grad_x_elements <= 16 * 1024 * 1024
