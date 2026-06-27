@@ -88,4 +88,4 @@ def benchmark(s: ExperimentShape, N: int = 100):
 
 for e in experiments:
     sel_time, fw_time, bw_time = benchmark(e)
-    print(f"Shape: B={e.B}, T={e.T}, N={e.N}, E={e.E}, K={e.K}, N_E={e.N_E} | sel: {sel_time:.6f}s, fw: {fw_time:.6f}s, bw: {bw_time:.6f}s")
+    print(f"Shape: B={e.B}, T={e.T}, N={e.N}, E={e.E}, K={e.K}, N_E={e.N_E} | sel: {sel_time*1000:.6f}ms, fw: {fw_time*1000:.6f}ms, bw: {bw_time*1000:.6f}ms")
