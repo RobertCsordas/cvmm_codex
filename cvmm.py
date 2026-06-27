@@ -741,7 +741,7 @@ class CVMM(torch.autograd.Function):
             can_reduce_routes = reduction_weight is None and need_grad_x and not out_index_is_none and top_k > 1
             grad_x_elements = x.numel()
             use_atomic_reduction = can_reduce_routes and grad_x_elements <= 16 * 1024 * 1024
-            use_route_accumulation = can_reduce_routes and not use_atomic_reduction and x.shape[-1] <= 128
+            use_route_accumulation = can_reduce_routes and not use_atomic_reduction and x.shape[-1] <= 64
 
             if use_atomic_reduction:
                 grad_x = cvmm_triton_reduction_call(
