@@ -10,6 +10,7 @@ import triton
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
+import cvmm as cvmm_module
 from cvmm import CVMMSel, cvmm, cvmm_prepare_sel2
 
 
@@ -118,6 +119,11 @@ def benchmark(s: ExperimentShape, n_iters: int):
 
 def run_one(index: int, n_iters: int):
     install_pg199_benchmark_workaround()
+    if os.environ.get("CVMM_FORCE_LOWMEM_BACKWARD") == "1":
+        cvmm_module.cvmm_use_lowmem_grouped_backward = True
+        cvmm_module.cvmm_lowmem_min_top_k = 0
+        if "CVMM_LOWMEM_CHUNK_SIZE" in os.environ:
+            cvmm_module.cvmm_lowmem_chunk_size = int(os.environ["CVMM_LOWMEM_CHUNK_SIZE"])
     print("Selected GPU type:", torch.cuda.get_device_name(torch.cuda.current_device()))
     e = experiments[index]
     sel_time, fw_time, bw_time = benchmark(e, n_iters)
