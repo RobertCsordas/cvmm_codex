@@ -24,7 +24,7 @@ class CVMMSel:
 def cvmm_prepare_sel(sel: torch.Tensor, n_experts: int) -> CVMMSel:
     fsel = sel.flatten().to(torch.int32)
     ssel, sel_index = fsel.sort()
-    return CVMMSel(sel.to(torch.int32), ssel.view_as(sel), sel_index, None)
+    return CVMMSel(fsel.view_as(sel), ssel.view_as(sel), sel_index, None)
 
 
 def get_dtype():
@@ -57,6 +57,8 @@ cvmm_reduction_tuned_shapes = set()
 cvmm_use_lowmem_grouped_backward = os.environ.get("CVMM_DISABLE_LOWMEM_GROUPED_BACKWARD", "0").lower() not in ("1", "true", "yes", "on")
 cvmm_lowmem_min_top_k = int(os.environ.get("CVMM_LOWMEM_MIN_TOP_K", "32"))
 cvmm_lowmem_chunk_size = int(os.environ.get("CVMM_LOWMEM_CHUNK_SIZE", "0"))
+cvmm_force_gather_x_grad_w = os.environ.get("CVMM_GATHER_X_GRAD_W", "0").lower() in ("1", "true", "yes", "on")
+cvmm_gather_x_grad_w_max_top_k = int(os.environ.get("CVMM_GATHER_X_GRAD_W_MAX_TOP_K", "8"))
 
 
 
@@ -1086,7 +1088,6 @@ def create_kernels():
         grouped_x = None
         grad_w = None
         if need_grad_w:
-            grouped_x = cvmm_group_routes(x_flat, sel_index, top_k)
             M = x_flat.shape[-1]
             N = grads_flat.shape[-1]
             grad_w = torch.empty((n_experts, M, N), device=x.device, dtype=torch.float32)
@@ -1095,15 +1096,29 @@ def create_kernels():
                 triton.cdiv(N, META['BLOCK_N']),
                 n_experts,
             )
-            cvmm_grouped_bwd_w_kernel[grid](
-                grouped_x, grouped_grads, grad_w, offsets,
-                M, N, total_routes,
-                grouped_x.stride(0), grouped_x.stride(1),
-                grouped_grads.stride(0), grouped_grads.stride(1),
-                grad_w.stride(0), grad_w.stride(1), grad_w.stride(2),
-                dtype_id=dtype_to_type_id(op_dtype),
-                allow_tf32=False, #torch.backends.cuda.matmul.allow_tf32
-            )
+            use_gather_x_grad_w = cvmm_force_gather_x_grad_w or (cvmm_gather_x_grad_w_max_top_k > 0 and top_k <= cvmm_gather_x_grad_w_max_top_k)
+            if use_gather_x_grad_w:
+                cvmm_grouped_bwd_w_gather_x_kernel[grid](
+                    x_flat, grouped_grads, grad_w, offsets, sel_index,
+                    M, N, total_routes, top_k,
+                    x_flat.stride(0), x_flat.stride(1),
+                    grouped_grads.stride(0), grouped_grads.stride(1),
+                    grad_w.stride(0), grad_w.stride(1), grad_w.stride(2),
+                    sel_index.stride(0),
+                    dtype_id=dtype_to_type_id(op_dtype),
+                    allow_tf32=False, #torch.backends.cuda.matmul.allow_tf32
+                )
+            else:
+                grouped_x = cvmm_group_routes(x_flat, sel_index, top_k)
+                cvmm_grouped_bwd_w_kernel[grid](
+                    grouped_x, grouped_grads, grad_w, offsets,
+                    M, N, total_routes,
+                    grouped_x.stride(0), grouped_x.stride(1),
+                    grouped_grads.stride(0), grouped_grads.stride(1),
+                    grad_w.stride(0), grad_w.stride(1), grad_w.stride(2),
+                    dtype_id=dtype_to_type_id(op_dtype),
+                    allow_tf32=False, #torch.backends.cuda.matmul.allow_tf32
+                )
             if key_dtype != torch.float32:
                 grad_w = grad_w.to(key_dtype)
 
@@ -1676,7 +1691,7 @@ def cvmm_prepare_sel2(sel: torch.Tensor, w: Optional[torch.Tensor] = None, route
     ssel, sel_index = fsel.sort()
 
     if route_input:
-        return CVMMSel(sel.to(torch.int32), ssel.view_as(sel), sel_index, None, w)
+        return CVMMSel(fsel.view_as(sel), ssel.view_as(sel), sel_index, None, w)
 
     in_index = sel_index // n_per_batch
-    return CVMMSel(sel.to(torch.int32), ssel.view_as(sel), in_index, sel_index, w)
+    return CVMMSel(fsel.view_as(sel), ssel.view_as(sel), in_index, sel_index, w)
