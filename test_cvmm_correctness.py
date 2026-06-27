@@ -27,11 +27,7 @@ def _check_case(weighted: bool, route_input: bool = False):
     if weighted:
         weights = torch.randn(b, t, top_k, device=device, dtype=torch.float32, requires_grad=True)
 
-    sel2 = cvmm_prepare_sel2(sel, weights)
-    if route_input:
-        sel2 = sel2.clone()
-        sel2.sel_index = sel2.out_index
-        sel2.out_index = None
+    sel2 = cvmm_prepare_sel2(sel, weights, route_input=route_input)
 
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         actual = cvmm(x, sel2, keys)

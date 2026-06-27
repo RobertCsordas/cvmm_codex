@@ -61,12 +61,7 @@ experiments: List[ExperimentShape] = [
 
 
 def prepare_selection(sel: torch.Tensor, weights: torch.Tensor | None, route_input: bool) -> CVMMSel:
-    sel2 = cvmm_prepare_sel2(sel, weights)
-    if route_input:
-        sel2 = sel2.clone()
-        sel2.sel_index = sel2.out_index
-        sel2.out_index = None
-    return sel2
+    return cvmm_prepare_sel2(sel, weights, route_input=route_input)
 
 
 def benchmark(s: ExperimentShape, n_iters: int):

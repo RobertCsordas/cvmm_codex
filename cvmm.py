@@ -57,6 +57,16 @@ cvmm_lowmem_min_top_k = int(os.environ.get("CVMM_LOWMEM_MIN_TOP_K", "32"))
 cvmm_lowmem_chunk_size = int(os.environ.get("CVMM_LOWMEM_CHUNK_SIZE", "0"))
 
 
+
+def _cvmm_expert_offsets(sorted_experts: torch.Tensor, n_experts: int) -> torch.Tensor:
+    unique_experts, counts = torch.unique_consecutive(sorted_experts, return_counts=True)
+    if unique_experts.numel() == n_experts:
+        return counts.cumsum(0)
+
+    expert_counts = torch.zeros((n_experts,), device=sorted_experts.device, dtype=counts.dtype)
+    expert_counts[unique_experts.long()] = counts
+    return expert_counts.cumsum(0)
+
 def _cvmm_lowmem_chunk_size(top_k: int) -> int:
     chunk_size = cvmm_lowmem_chunk_size
     if chunk_size <= 0:
@@ -903,7 +913,7 @@ def create_kernels():
         total_routes = sel_flat.numel()
         assert total_routes == grads_flat.shape[0]
 
-        offsets = torch.bincount(sel_flat.to(torch.int64), minlength=n_experts).cumsum(0)
+        offsets = _cvmm_expert_offsets(sel_flat, n_experts)
         grouped_grads = cvmm_group_routes(grads_flat, sel_index, 1)
 
         grouped_x = None
@@ -979,7 +989,7 @@ def create_kernels():
 
         grad_w = None
         if need_grad_w:
-            offsets = torch.bincount(sel_flat.to(torch.int64), minlength=n_experts).cumsum(0)
+            offsets = _cvmm_expert_offsets(sel_flat, n_experts)
             grouped_grads = cvmm_group_routes(grads_flat, sel_index, 1)
             M = x_flat.shape[-1]
             N = grads_flat.shape[-1]
@@ -1357,17 +1367,15 @@ def cvmm(x: torch.Tensor, sel: Union[torch.Tensor, CVMMSel], keys: torch.Tensor)
     return CVMM.apply(x, sel.raw_sel, sel.sel_index, sel.sel, keys, sel.out_index, sel.reduction_weight)
 
 
-def cvmm_prepare_sel2(sel: torch.Tensor, w: Optional[torch.Tensor] = None) -> CVMMSel:
+def cvmm_prepare_sel2(sel: torch.Tensor, w: Optional[torch.Tensor] = None, route_input: bool = False) -> CVMMSel:
     # Has multiple selections for each batch element
     n_per_batch = sel.shape[-1]
-
-    # indices = torch.arange(sel.nelement() // n_per_batch, device=sel.device, dtype=torch.int32)
-    # indices = indices.repeat_interleave(n_per_batch).flatten()
 
     fsel = sel.flatten().to(torch.int32)
     ssel, sel_index = fsel.sort()
 
-    # in_index = indices[sel_index]
-    in_index = sel_index // n_per_batch
+    if route_input:
+        return CVMMSel(sel.to(torch.int32), ssel.view_as(sel), sel_index, None, w)
 
+    in_index = sel_index // n_per_batch
     return CVMMSel(sel.to(torch.int32), ssel.view_as(sel), in_index, sel_index, w)
