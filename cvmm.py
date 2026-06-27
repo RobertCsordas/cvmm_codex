@@ -803,7 +803,11 @@ class CVMM(torch.autograd.Function):
                 grad_x_full = grad_x_full.view(*x.shape[:-1], -1, x.shape[-1])
                 if reduction_weight is not None:
                     if need_grad_x:
-                        grad_x = (reduction_weight.view(*grad_x_full.shape[:-1]).unsqueeze(-2).type_as(grad_x_full) @ grad_x_full).squeeze(-2)
+                        weights = reduction_weight.view(*grad_x_full.shape[:-1]).type_as(grad_x_full)
+                        if grad_x_full.shape[-2] == 1:
+                            grad_x = grad_x_full.squeeze(-2) * weights.squeeze(-1).unsqueeze(-1)
+                        else:
+                            grad_x = (weights.unsqueeze(-2) @ grad_x_full).squeeze(-2)
                     if need_grad_reduction_weight:
                         grad_w_off = (grad_x_full.type_as(reduction_weight) @ x.unsqueeze(-1).type_as(reduction_weight)).squeeze(-1).view_as(reduction_weight)
                 elif need_grad_x and grad_x_full.shape[-2] != 1:
