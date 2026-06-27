@@ -43,12 +43,19 @@ experiments: List[ExperimentShape] = [
     # SigmaMoE feed-forward up/down projections from moeut.py.
     ExperimentShape("ff_up_1024", 8, 2048, 1024, 128, 8, 512),
     ExperimentShape("ff_down_1024_weighted", 8, 2048, 128, 1024, 8, 512, weighted=True, route_input=True),
+    ExperimentShape("ff_up_2048", 4, 2048, 2048, 128, 8, 512),
+    ExperimentShape("ff_down_2048_weighted", 4, 2048, 128, 2048, 8, 512, weighted=True, route_input=True),
     # SwitchHead v/o projections. N_E is n_heads * n_experts and K is n_heads * moe_k.
     ExperimentShape("switch_v_1024", 8, 2048, 1024, 64, 32, 512),
     ExperimentShape("switch_o_1024_weighted", 8, 2048, 64, 1024, 32, 512, weighted=True, route_input=True),
+    ExperimentShape("switch_v_2048_h32", 4, 2048, 2048, 64, 64, 1024),
+    ExperimentShape("switch_o_2048_h32_weighted", 4, 2048, 64, 2048, 64, 1024, weighted=True, route_input=True),
     # Smaller consumer-GPU oriented model shapes.
     ExperimentShape("ff_up_768", 4, 2048, 768, 128, 8, 256),
     ExperimentShape("switch_o_768_weighted", 4, 2048, 64, 768, 24, 384, weighted=True, route_input=True),
+    # Larger-model stress probes; 1024-2048 is the main decision range.
+    ExperimentShape("ff_up_4096_stress", 2, 1024, 4096, 128, 8, 512),
+    ExperimentShape("ff_down_4096_weighted_stress", 2, 1024, 128, 4096, 8, 512, weighted=True, route_input=True),
 ]
 
 
