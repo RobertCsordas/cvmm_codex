@@ -288,6 +288,67 @@ def create_kernels():
 
     @triton.autotune(
         configs=[
+            triton.Config({'BLOCK_ROUTES': 128, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_stages=3, num_warps=4),
+            triton.Config({'BLOCK_ROUTES': 128, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_stages=3, num_warps=4),
+            triton.Config({'BLOCK_ROUTES': 64, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_stages=3, num_warps=4),
+            triton.Config({'BLOCK_ROUTES': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
+        ],
+        key=['M', 'N', 'K', 'dtype_id', 'out_dtype_id', 'allow_tf32']
+    )
+    @triton.jit
+    def cvmm_grouped_bwd_x_kernel(
+        grad_ptr, key_ptr, out_ptr, route_index_ptr, sel_ptr,
+        M: tl.constexpr, N: tl.constexpr, K: tl.constexpr, E: tl.constexpr,
+        stride_gm, stride_gk,
+        stride_ke, stride_kk, stride_kn,
+        stride_om, stride_on,
+        stride_route_index, stride_sel,
+        dtype_id: tl.constexpr, out_dtype_id: tl.constexpr, allow_tf32: tl.constexpr,
+        BLOCK_ROUTES: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr
+    ):
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+        offs_m = pid_m * BLOCK_ROUTES + tl.arange(0, BLOCK_ROUTES)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        m_mask = offs_m < M
+        n_mask = offs_n < N
+        expert_ids = tl.load(sel_ptr + offs_m * stride_sel, mask=m_mask, other=E)
+        first_expert = tl.min(expert_ids)
+        last_expert = tl.minimum(tl.max(expert_ids), E - 1)
+
+        for expert in range(first_expert, last_expert + 1):
+            row_mask = expert_ids == expert
+            acc = tl.zeros((BLOCK_ROUTES, BLOCK_N), dtype=tl.float32)
+            offs_k = tl.arange(0, BLOCK_K)
+            grad_ptrs = grad_ptr + offs_m[:, None] * stride_gm + offs_k[None, :] * stride_gk
+            key_ptrs = key_ptr + expert * stride_ke + offs_k[:, None] * stride_kk + offs_n[None, :] * stride_kn
+            for k_start in range(0, tl.cdiv(K, BLOCK_K)):
+                k_mask = offs_k < K - k_start * BLOCK_K
+                g = tl.load(grad_ptrs, mask=row_mask[:, None] & k_mask[None, :], other=0.0)
+                w = tl.load(key_ptrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0)
+                if dtype_id == 1:
+                    g = g.to(tl.float16)
+                    w = w.to(tl.float16)
+                elif dtype_id == 2:
+                    g = g.to(tl.bfloat16)
+                    w = w.to(tl.bfloat16)
+                acc += tl.dot(g, w, allow_tf32=allow_tf32)
+                grad_ptrs += BLOCK_K * stride_gk
+                key_ptrs += BLOCK_K * stride_kk
+
+            if out_dtype_id == 1:
+                out_vals = acc.to(tl.float16)
+            elif out_dtype_id == 2:
+                out_vals = acc.to(tl.bfloat16)
+            else:
+                out_vals = acc
+            route_idx = tl.load(route_index_ptr + offs_m * stride_route_index, mask=m_mask, other=0)
+            out_ptrs = out_ptr + route_idx[:, None] * stride_om + offs_n[None, :] * stride_on
+            tl.store(out_ptrs, out_vals, mask=row_mask[:, None] & n_mask[None, :])
+
+
+    @triton.autotune(
+        configs=[
             triton.Config({'BLOCK_ROUTES': 32, 'BLOCK_M': 128, 'BLOCK_N': 128}, num_stages=4, num_warps=4),
             triton.Config({'BLOCK_ROUTES': 32, 'BLOCK_M': 128, 'BLOCK_N': 64}, num_stages=4, num_warps=4),
             triton.Config({'BLOCK_ROUTES': 32, 'BLOCK_M': 64, 'BLOCK_N': 128}, num_stages=4, num_warps=4),
@@ -801,15 +862,24 @@ def create_kernels():
         if need_grad_x:
             if grouped_x is None:
                 grouped_x = torch.empty((total_routes, x_flat.shape[-1]), device=x.device, dtype=x.dtype)
-            sorted_positions = torch.arange(total_routes, device=x.device, dtype=sel_index.dtype)
-            cvmm_triton_into(
-                grouped_grads,
-                sorted_positions,
-                sel_flat,
-                keys.transpose(1, 2),
-                grouped_x,
-                sel_index,
-                op_dtype,
+            keys_t = keys.transpose(1, 2)
+            M = total_routes
+            N = x_flat.shape[-1]
+            K = grads_flat.shape[-1]
+            grid = lambda META: (
+                triton.cdiv(M, META['BLOCK_ROUTES']),
+                triton.cdiv(N, META['BLOCK_N']),
+            )
+            cvmm_grouped_bwd_x_kernel[grid](
+                grouped_grads, keys_t, grouped_x, sel_index, sel_flat,
+                M, N, K, n_experts,
+                grouped_grads.stride(0), grouped_grads.stride(1),
+                keys_t.stride(0), keys_t.stride(1), keys_t.stride(2),
+                grouped_x.stride(0), grouped_x.stride(1),
+                sel_index.stride(0), sel_flat.stride(0),
+                dtype_id=dtype_to_type_id(op_dtype),
+                out_dtype_id=dtype_to_type_id(grouped_x.dtype),
+                allow_tf32=False, #torch.backends.cuda.matmul.allow_tf32
             )
             grad_x = grouped_x.view(*x.shape[:-1], top_k, x.shape[-1]).sum(-2).to(x.dtype).view_as(x)
 
