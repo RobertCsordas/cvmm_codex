@@ -128,13 +128,13 @@ def backend_status() -> dict[str, str]:
 
     try:
         importlib.import_module("megablocks")
-        status["MegaBlocks"] = "importable, but not benchmarked by this script; requires a working grouped_gemm/STK path"
+        status["MegaBlocks"] = "importable, but FFN-level only here; projection script requires a selected-linear primitive"
     except Exception as exc:
         status["MegaBlocks"] = f"unavailable: {type(exc).__name__}: {exc}"
 
     try:
         importlib.import_module("tutel")
-        status["Tutel"] = "importable, but not benchmarked by this script; no direct selected-linear primitive"
+        status["Tutel"] = "importable, but FFN-level only here; projection script requires a selected-linear primitive"
     except Exception as exc:
         status["Tutel"] = f"unavailable: {type(exc).__name__}: {exc}"
     return status
