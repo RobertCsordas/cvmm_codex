@@ -52,15 +52,21 @@ a precision-identical replacement.
 | `ff_up_4096_stress` | 0.381 | 1.898 | 3.652 | 5.931 | 2.29x | 5.57x | 6.3% | 1.46x |
 | `ff_down_4096_weighted_stress` | 0.300 | 2.192 | 3.348 | 5.840 | 2.55x | 2.12x | 6.1% | 2.90x |
 
-MegaBlocks and Tutel are full MoE FFN systems rather than per-projection CVMM
-primitive replacements. They should be compared with a separate FFN-level
-benchmark covering routing/dispatch, up projection, activation, down projection,
-and combine.
+### FFN stack
 
-| Backend | Comparable unit | Local status | Blocker before timing |
-| --- | --- | --- | --- |
-| MegaBlocks 0.10.0 | Dropless MoE FFN (`dMoE` / `ParallelDroplessMLP`): token grouping, expert MLP, and scatter/combine. This can represent the MoE FFN path, not an isolated CVMM projection. | Not timed. Source import works with the isolated `/tmp/cvmm3_compare_vendor` install. | `mlp_impl="sparse"` is rejected by MegaBlocks with Triton >= 3.2; `mlp_impl="grouped"` needs `grouped_gemm`. `grouped_gemm==0.3.0` failed to build against `/usr/bin/nvcc` 12.0 and PyTorch 2.12.1+cu130, and the STK sparse smoke path hit an illegal memory access. |
-| Tutel `add1bf1` | Full `moe_layer`: top-k routing, `fast_encode` dispatch, batched expert FFN, and `fast_decode` combine. This can represent the MoE FFN path, but not the SwitchHead projection-only cases. | Not timed. Source import works, but the CUDA extension is not installed. | Building `tutel_custom_kernel` failed because `nccl.h` is missing. Installing an NCCL development package matching the CUDA/PyTorch stack, or building a single-GPU/no-NCCL Tutel variant if supported, is needed before an FFN benchmark can run. |
+Measured on the same GPU on 2026-06-28 with the PG199 workaround disabled.
+Rows are full top-k MoE FFN stacks: gate matmul, softmax/top-k, up projection,
+GELU, weighted down projection/combine, and backward. Raw score columns are
+milliseconds per iteration from `benchmark_ffn_moe.py` with 5 iterations.
+`Tutel / CVMM` is the total-time ratio, so lower is faster and `1.0x` is parity
+with the CVMM FFN stack.
+
+| Shape | CVMM fw ms | CVMM bw ms | CVMM total ms | Tutel fw ms | Tutel bw ms | Tutel total ms | Tutel / CVMM |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `ffn_1024` | 3.954 | 5.232 | 9.186 | 22.870 | 17.100 | 39.970 | 4.35x |
+| `ffn_2048` | 4.131 | 5.871 | 10.001 | 18.580 | 17.724 | 36.304 | 3.63x |
+| `ffn_768` | 2.402 | 2.945 | 5.348 | 8.934 | 6.436 | 15.371 | 2.87x |
+| `ffn_4096_stress` | 4.122 | 6.530 | 10.652 | 10.900 | 17.389 | 28.289 | 2.66x |
 
 The weighted down/O projections are now close to the dense-equivalent bound on
 the main 1024-2048 shapes. The remaining large gap is mostly in the unweighted
