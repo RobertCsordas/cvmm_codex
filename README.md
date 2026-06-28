@@ -105,6 +105,21 @@ FFN stack.
 | `ffn_4096_h256_stress` | 6.606 | 11.092 | 17.699 | 14.362 | 27.881 | 42.243 | 2.39x |
 | `ffn_4096_h512_stress` | 11.029 | 20.269 | 31.298 | 21.226 | 49.606 | 70.832 | 2.26x |
 
+### Framework MoE stack probes
+
+Measured on the same GPU on 2026-06-28 with the PG199 CUDA-event workaround
+enabled. Rows are smaller full MoE FFN stacks from `benchmark_framework_moe.py`
+using 5 iterations; these shapes are intentionally small enough for DeepSpeed's
+native dense-dispatch path and Megatron's local legacy MoE path to run.
+`DeepSpeed / CVMM` and `Megatron / CVMM` are total-time ratios, so lower is
+faster and `1.0x` is parity with CVMM.
+
+| Shape | CVMM total ms | DeepSpeed total ms | DeepSpeed / CVMM | Megatron total ms | Megatron / CVMM |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `tiny_d128_h32_e16_k4` | 5.125 | 10.967 | 2.14x | 18.761 | 3.66x |
+| `small_d256_h64_e32_k4` | 5.044 | 21.692 | 4.30x | 32.933 | 6.53x |
+| `small_d512_h128_e64_k4` | 4.835 | 37.624 | 7.78x | 56.159 | 11.62x |
+
 The weighted down/O projections are now close to the dense-equivalent bound on
 the main 1024-2048 shapes. The remaining large gap is mostly in the unweighted
 up/V projections, especially the 2048 and 4096 stress cases.
