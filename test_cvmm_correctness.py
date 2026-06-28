@@ -1,5 +1,6 @@
 import torch
 
+import cvmm as cvmm_module
 from cvmm import cvmm, cvmm_prepare_sel2
 
 
@@ -69,6 +70,38 @@ def test_weighted_route_input():
     _check_case(True, route_input=True)
 
 
+def test_top32_lowmem_unweighted():
+    torch.manual_seed(2026)
+    device = "cuda"
+    b, t, d, out_d, n_experts, top_k = 2, 5, 32, 16, 64, 32
+
+    x = torch.randn(b, t, d, device=device, dtype=torch.bfloat16, requires_grad=True)
+    keys = torch.randn(n_experts, d, out_d, device=device, dtype=torch.float32, requires_grad=True)
+    sel = torch.randint(0, n_experts, (b, t, top_k), device=device)
+    old_chunk_size = cvmm_module.cvmm_lowmem_chunk_size
+    cvmm_module.cvmm_lowmem_chunk_size = 0
+    try:
+        sel2 = cvmm_prepare_sel2(sel)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            actual = cvmm(x, sel2, keys)
+        expected = _reference(x, sel, keys)
+        torch.testing.assert_close(actual.float(), expected.float(), rtol=5e-2, atol=1e-1)
+
+        grad = torch.randn_like(actual.float())
+        actual.backward(grad.to(actual.dtype))
+        actual_x_grad = x.grad.float()
+        actual_keys_grad = keys.grad.float()
+
+        x_ref = x.detach().clone().requires_grad_(True)
+        keys_ref = keys.detach().clone().requires_grad_(True)
+        expected = _reference(x_ref, sel, keys_ref)
+        expected.backward(grad)
+        torch.testing.assert_close(actual_x_grad, x_ref.grad.float(), rtol=3e-1, atol=6e-1)
+        torch.testing.assert_close(actual_keys_grad, keys_ref.grad.float(), rtol=1e-1, atol=1e-1)
+    finally:
+        cvmm_module.cvmm_lowmem_chunk_size = old_chunk_size
+
+
 def test_weighted_route_input_reused_selector():
     torch.manual_seed(1251)
     device = "cuda"
@@ -94,5 +127,6 @@ if __name__ == "__main__":
     test_unweighted()
     test_weighted()
     test_weighted_route_input()
+    test_top32_lowmem_unweighted()
     test_weighted_route_input_reused_selector()
     print("cvmm correctness tests passed")

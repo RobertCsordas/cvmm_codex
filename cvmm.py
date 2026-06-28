@@ -1212,43 +1212,65 @@ def create_kernels():
         if need_grad_x:
             tokens = x_flat.shape[0]
             chunk_size = _cvmm_lowmem_chunk_size(top_k)
-            grad_x = torch.zeros_like(x_flat)
             keys_t = keys.transpose(1, 2)
-            raw_sel = torch.empty_like(sel_flat)
-            raw_sel[sel_index] = sel_flat
-            raw_sel = raw_sel.view(tokens, top_k)
-            grad_routes = grads_flat.view(tokens, top_k, grads_flat.shape[-1])
+            N = x_flat.shape[-1]
+            K = grads_flat.shape[-1]
 
-            for chunk_start in range(0, top_k, chunk_size):
-                chunk_end = min(chunk_start + chunk_size, top_k)
-                route_count = chunk_end - chunk_start
-                sel_chunk = raw_sel[:, chunk_start:chunk_end].reshape(-1)
-                sel_chunk, sel_chunk_index = sel_chunk.sort()
-                grad_chunk = grad_routes[:, chunk_start:chunk_end, :].reshape(-1, grads_flat.shape[-1])
-                grouped_grad_chunk = cvmm_group_routes(grad_chunk, sel_chunk_index, 1)
-                chunk_routes = sel_chunk.numel()
-                chunk_grad_x = torch.empty((chunk_routes, x_flat.shape[-1]), device=x.device, dtype=x.dtype)
-                M = chunk_routes
-                N = x_flat.shape[-1]
-                K = grads_flat.shape[-1]
+            if chunk_size >= top_k:
+                grouped_grad_chunk = cvmm_group_routes(grads_flat, sel_index, 1)
+                chunk_grad_x = torch.empty((total_routes, N), device=x.device, dtype=x.dtype)
+                M = total_routes
                 grid = lambda META: (
                     triton.cdiv(M, META['BLOCK_ROUTES']),
                     triton.cdiv(N, META['BLOCK_N']),
                 )
                 cvmm_grouped_bwd_x_kernel[grid](
-                    grouped_grad_chunk, keys_t, chunk_grad_x, sel_chunk_index, sel_chunk,
+                    grouped_grad_chunk, keys_t, chunk_grad_x, sel_index, sel_flat,
                     M, N, K, n_experts,
                     grouped_grad_chunk.stride(0), grouped_grad_chunk.stride(1),
                     keys_t.stride(0), keys_t.stride(1), keys_t.stride(2),
                     chunk_grad_x.stride(0), chunk_grad_x.stride(1),
-                    sel_chunk_index.stride(0), sel_chunk.stride(0),
+                    sel_index.stride(0), sel_flat.stride(0),
                     dtype_id=dtype_to_type_id(op_dtype),
                     out_dtype_id=dtype_to_type_id(chunk_grad_x.dtype),
                     allow_tf32=False, #torch.backends.cuda.matmul.allow_tf32
                 )
-                grad_x += chunk_grad_x.view(tokens, route_count, x_flat.shape[-1]).sum(1)
+                grad_x = chunk_grad_x.view(tokens, top_k, N).sum(1).view_as(x)
+            else:
+                grad_x = torch.zeros_like(x_flat)
+                raw_sel = torch.empty_like(sel_flat)
+                raw_sel[sel_index] = sel_flat
+                raw_sel = raw_sel.view(tokens, top_k)
+                grad_routes = grads_flat.view(tokens, top_k, grads_flat.shape[-1])
 
-            grad_x = grad_x.view_as(x)
+                for chunk_start in range(0, top_k, chunk_size):
+                    chunk_end = min(chunk_start + chunk_size, top_k)
+                    route_count = chunk_end - chunk_start
+                    sel_chunk = raw_sel[:, chunk_start:chunk_end].reshape(-1)
+                    sel_chunk, sel_chunk_index = sel_chunk.sort()
+                    grad_chunk = grad_routes[:, chunk_start:chunk_end, :].reshape(-1, grads_flat.shape[-1])
+                    grouped_grad_chunk = cvmm_group_routes(grad_chunk, sel_chunk_index, 1)
+                    chunk_routes = sel_chunk.numel()
+                    chunk_grad_x = torch.empty((chunk_routes, N), device=x.device, dtype=x.dtype)
+                    M = chunk_routes
+                    grid = lambda META: (
+                        triton.cdiv(M, META['BLOCK_ROUTES']),
+                        triton.cdiv(N, META['BLOCK_N']),
+                    )
+                    cvmm_grouped_bwd_x_kernel[grid](
+                        grouped_grad_chunk, keys_t, chunk_grad_x, sel_chunk_index, sel_chunk,
+                        M, N, K, n_experts,
+                        grouped_grad_chunk.stride(0), grouped_grad_chunk.stride(1),
+                        keys_t.stride(0), keys_t.stride(1), keys_t.stride(2),
+                        chunk_grad_x.stride(0), chunk_grad_x.stride(1),
+                        sel_chunk_index.stride(0), sel_chunk.stride(0),
+                        dtype_id=dtype_to_type_id(op_dtype),
+                        out_dtype_id=dtype_to_type_id(chunk_grad_x.dtype),
+                        allow_tf32=False, #torch.backends.cuda.matmul.allow_tf32
+                    )
+                    grad_x += chunk_grad_x.view(tokens, route_count, N).sum(1)
+
+                grad_x = grad_x.view_as(x)
 
         return grad_x, grad_w
 
