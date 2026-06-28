@@ -70,6 +70,22 @@ def test_weighted_route_input():
     _check_case(True, route_input=True)
 
 
+def test_expert_offsets_kernel():
+    cvmm_module.create_kernels()
+    old_call = cvmm_module.cvmm_expert_offsets_call
+    try:
+        for n_experts in (1, 7, 64, 512):
+            for total_routes in (1, 13, 1000):
+                sel = torch.randint(0, n_experts, (total_routes,), device="cuda", dtype=torch.int32).sort().values
+                fast = cvmm_module._cvmm_expert_offsets(sel, n_experts)
+                cvmm_module.cvmm_expert_offsets_call = None
+                ref = cvmm_module._cvmm_expert_offsets(sel, n_experts)
+                cvmm_module.cvmm_expert_offsets_call = old_call
+                torch.testing.assert_close(fast.cpu(), ref.cpu(), rtol=0, atol=0)
+    finally:
+        cvmm_module.cvmm_expert_offsets_call = old_call
+
+
 def test_top32_lowmem_unweighted():
     torch.manual_seed(2026)
     device = "cuda"
@@ -127,6 +143,7 @@ if __name__ == "__main__":
     test_unweighted()
     test_weighted()
     test_weighted_route_input()
+    test_expert_offsets_kernel()
     test_top32_lowmem_unweighted()
     test_weighted_route_input_reused_selector()
     print("cvmm correctness tests passed")

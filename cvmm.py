@@ -49,12 +49,14 @@ cvmm_triton_into_call = None
 cvmm_triton_accumulate_call = None
 cvmm_triton_reduction_call = None
 cvmm_group_routes_call = None
+cvmm_expert_offsets_call = None
 cvmm_grouped_backward_call = None
 cvmm_grouped_backward_lowmem_call = None
 cvmm_grouped_backward_weighted_w_call = None
 cvmm_weighted_route_bwd_x_call = None
 cvmm_reduction_tuned_shapes = set()
 cvmm_use_lowmem_grouped_backward = os.environ.get("CVMM_DISABLE_LOWMEM_GROUPED_BACKWARD", "0").lower() not in ("1", "true", "yes", "on")
+cvmm_use_triton_expert_offsets = os.environ.get("CVMM_DISABLE_TRITON_EXPERT_OFFSETS", "0").lower() not in ("1", "true", "yes", "on")
 cvmm_fast_single_expert_indexed_forward = os.environ.get("CVMM_FAST_SINGLE_EXPERT_INDEXED_FORWARD", "auto").lower()
 cvmm_lowmem_min_top_k = int(os.environ.get("CVMM_LOWMEM_MIN_TOP_K", "32"))
 cvmm_lowmem_chunk_size = int(os.environ.get("CVMM_LOWMEM_CHUNK_SIZE", "0"))
@@ -64,6 +66,9 @@ cvmm_gather_x_grad_w_max_top_k = int(os.environ.get("CVMM_GATHER_X_GRAD_W_MAX_TO
 
 
 def _cvmm_expert_offsets(sorted_experts: torch.Tensor, n_experts: int) -> torch.Tensor:
+    if cvmm_use_triton_expert_offsets and cvmm_expert_offsets_call is not None and sorted_experts.is_cuda:
+        return cvmm_expert_offsets_call(sorted_experts, n_experts)
+
     unique_experts, counts = torch.unique_consecutive(sorted_experts, return_counts=True)
     if unique_experts.numel() == n_experts:
         return counts.cumsum(0)
@@ -88,7 +93,7 @@ def _cvmm_use_fast_single_expert_indexed_forward(device: torch.device) -> bool:
     return props.major == 8 and props.minor == 0
 
 def create_kernels():
-    global cvmm_backward_kernel3, cvmm_triton_call, cvmm_triton_into_call, cvmm_triton_accumulate_call, cvmm_triton_reduction_call, cvmm_group_routes_call, cvmm_grouped_backward_call, cvmm_grouped_backward_lowmem_call, cvmm_grouped_backward_weighted_w_call, cvmm_weighted_route_bwd_x_call
+    global cvmm_backward_kernel3, cvmm_triton_call, cvmm_triton_into_call, cvmm_triton_accumulate_call, cvmm_triton_reduction_call, cvmm_group_routes_call, cvmm_expert_offsets_call, cvmm_grouped_backward_call, cvmm_grouped_backward_lowmem_call, cvmm_grouped_backward_weighted_w_call, cvmm_weighted_route_bwd_x_call
 
     if cvmm_triton_call is not None:
         return
@@ -305,6 +310,29 @@ def create_kernels():
             c_ptrs = c_ptr + stride_cm * remap_offs_cm[:, None] + stride_cn * offs_cn[None, :]
             c_mask = ((offs_cm[:, None] < M) & (sel_all[:, None] == matrix_id)) & (offs_cn[None, :] < N)
             tl.atomic_add(c_ptrs, accumulator, mask=c_mask)
+
+
+    @triton.jit
+    def cvmm_expert_offsets_kernel(
+        sel_ptr, out_ptr,
+        TOTAL_ROUTES: tl.constexpr, N_EXPERTS: tl.constexpr, stride_sel,
+        MAX_STEPS: tl.constexpr, BLOCK_E: tl.constexpr
+    ):
+        pid = tl.program_id(0)
+        experts = pid * BLOCK_E + tl.arange(0, BLOCK_E)
+        active = experts < N_EXPERTS
+        lo = tl.zeros((BLOCK_E,), dtype=tl.int64)
+        hi = tl.full((BLOCK_E,), TOTAL_ROUTES, dtype=tl.int64)
+
+        for _ in range(0, MAX_STEPS):
+            searching = active & (lo < hi)
+            mid = (lo + hi) // 2
+            vals = tl.load(sel_ptr + mid * stride_sel, mask=searching, other=N_EXPERTS)
+            go_right = vals <= experts
+            lo = tl.where(searching & go_right, mid + 1, lo)
+            hi = tl.where(searching & ~go_right, mid, hi)
+
+        tl.store(out_ptr + experts, lo, mask=active)
 
 
     @triton.jit
@@ -1077,6 +1105,21 @@ def create_kernels():
                 tl.atomic_add(grad_weight_ptr + route_ids * stride_grad_weight, gate_part, mask=offs_m < M)
 
 
+    def cvmm_expert_offsets(sorted_experts: torch.Tensor, n_experts: int):
+        sorted_experts = sorted_experts.flatten()
+        out = torch.empty((n_experts,), device=sorted_experts.device, dtype=torch.int64)
+        total_routes = sorted_experts.numel()
+        max_steps = max(1, total_routes.bit_length())
+        grid = (triton.cdiv(n_experts, 64),)
+        cvmm_expert_offsets_kernel[grid](
+            sorted_experts, out,
+            TOTAL_ROUTES=total_routes, N_EXPERTS=n_experts,
+            stride_sel=sorted_experts.stride(0),
+            MAX_STEPS=max_steps, BLOCK_E=64,
+        )
+        return out
+
+
     def cvmm_group_routes(src: torch.Tensor, route_index: torch.Tensor, fan_out: int):
         src = src.flatten(end_dim=-2)
         route_index = route_index.flatten()
@@ -1415,6 +1458,7 @@ def create_kernels():
     cvmm_triton_accumulate_call = cvmm_triton_accumulate
     cvmm_triton_reduction_call = cvmm_triton_reduction
     cvmm_group_routes_call = cvmm_group_routes
+    cvmm_expert_offsets_call = cvmm_expert_offsets
     cvmm_grouped_backward_call = cvmm_grouped_backward
     cvmm_grouped_backward_lowmem_call = cvmm_grouped_backward_lowmem
     cvmm_grouped_backward_weighted_w_call = cvmm_grouped_backward_weighted_w
