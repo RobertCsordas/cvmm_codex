@@ -1,6 +1,10 @@
 # CVMM
 
-Conditional vector-matrix multiplication kernels for MoE-style projections.
+Conditional vector-matrix multiplication kernels for MoE-style projections. Used by [MoEUT](https://github.com/RobertCsordas/moeut) and [σ-MoE](https://github.com/RobertCsordas/moe_layer/blob/master/triton_src/moe_layer/cvmm.py).
+
+This is a vibe-optimized version of the kernel using Codex 5.5. Should be used with caution.
+
+The code is optimized on NVIDIA DRIVE-PG199-PROD (in my home GPU server), which is a 32Gb A100 variant. Should work equally well on standard A100s.
 
 ## Benchmarks
 
