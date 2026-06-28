@@ -55,6 +55,7 @@ cvmm_grouped_backward_weighted_w_call = None
 cvmm_weighted_route_bwd_x_call = None
 cvmm_reduction_tuned_shapes = set()
 cvmm_use_lowmem_grouped_backward = os.environ.get("CVMM_DISABLE_LOWMEM_GROUPED_BACKWARD", "0").lower() not in ("1", "true", "yes", "on")
+cvmm_fast_single_expert_indexed_forward = os.environ.get("CVMM_FAST_SINGLE_EXPERT_INDEXED_FORWARD", "auto").lower()
 cvmm_lowmem_min_top_k = int(os.environ.get("CVMM_LOWMEM_MIN_TOP_K", "32"))
 cvmm_lowmem_chunk_size = int(os.environ.get("CVMM_LOWMEM_CHUNK_SIZE", "0"))
 cvmm_force_gather_x_grad_w = os.environ.get("CVMM_GATHER_X_GRAD_W", "0").lower() in ("1", "true", "yes", "on")
@@ -76,6 +77,15 @@ def _cvmm_lowmem_chunk_size(top_k: int) -> int:
     if chunk_size <= 0:
         chunk_size = top_k
     return min(top_k, chunk_size)
+
+def _cvmm_use_fast_single_expert_indexed_forward(device: torch.device) -> bool:
+    setting = cvmm_fast_single_expert_indexed_forward
+    if setting in ("0", "false", "no", "off", "disable", "disabled"):
+        return False
+    if setting in ("1", "true", "yes", "on", "enable", "enabled"):
+        return True
+    props = torch.cuda.get_device_properties(device)
+    return props.major == 8 and props.minor == 0
 
 def create_kernels():
     global cvmm_backward_kernel3, cvmm_triton_call, cvmm_triton_into_call, cvmm_triton_accumulate_call, cvmm_triton_reduction_call, cvmm_group_routes_call, cvmm_grouped_backward_call, cvmm_grouped_backward_lowmem_call, cvmm_grouped_backward_weighted_w_call, cvmm_weighted_route_bwd_x_call
@@ -807,6 +817,10 @@ def create_kernels():
         if out_index.numel() == 1 and out_index == -1:
             out_index_is_none = True
 
+        fast_single_expert = (out_index_is_none and N <= 1024) or (
+            not out_index_is_none and N <= 1024 and _cvmm_use_fast_single_expert_indexed_forward(x.device)
+        )
+
         cvmm_kernel[grid](
             x, keys, out, sel_index, sel, out_index,
             M, N, K,
@@ -819,7 +833,7 @@ def create_kernels():
             out_dtype_id=dtype_to_type_id(out.dtype),
             allow_tf32=False, #torch.backends.cuda.matmul.allow_tf32
             ACCUMULATE_OUTPUT=False,
-            FAST_SINGLE_EXPERT=out_index_is_none and N <= 1024,
+            FAST_SINGLE_EXPERT=fast_single_expert,
         )
 
         return out.view(*sel_shape, N)
@@ -849,6 +863,10 @@ def create_kernels():
         if out_index.numel() == 1 and out_index == -1:
             out_index_is_none = True
 
+        fast_single_expert = (out_index_is_none and N <= 1024) or (
+            not out_index_is_none and N <= 1024 and _cvmm_use_fast_single_expert_indexed_forward(x.device)
+        )
+
         cvmm_kernel[grid](
             x, keys, out, sel_index, sel, out_index,
             M, N, K,
@@ -861,7 +879,7 @@ def create_kernels():
             out_dtype_id=dtype_to_type_id(out.dtype),
             allow_tf32=False, #torch.backends.cuda.matmul.allow_tf32
             ACCUMULATE_OUTPUT=False,
-            FAST_SINGLE_EXPERT=out_index_is_none and N <= 1024,
+            FAST_SINGLE_EXPERT=fast_single_expert,
         )
 
 
