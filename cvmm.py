@@ -74,7 +74,7 @@ def _cvmm_expert_offsets(sorted_experts: torch.Tensor, n_experts: int) -> torch.
 def _cvmm_lowmem_chunk_size(top_k: int) -> int:
     chunk_size = cvmm_lowmem_chunk_size
     if chunk_size <= 0:
-        chunk_size = max(1, top_k // 4)
+        chunk_size = top_k
     return min(top_k, chunk_size)
 
 def create_kernels():
