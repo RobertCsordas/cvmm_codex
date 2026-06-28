@@ -1184,6 +1184,7 @@ def create_kernels():
         assert total_routes == grads_flat.shape[0]
 
         grad_w = None
+        grouped_grads = None
         if need_grad_w:
             offsets = _cvmm_expert_offsets(sel_flat, n_experts)
             grouped_grads = cvmm_group_routes(grads_flat, sel_index, 1)
@@ -1217,7 +1218,8 @@ def create_kernels():
             K = grads_flat.shape[-1]
 
             if chunk_size >= top_k:
-                grouped_grad_chunk = cvmm_group_routes(grads_flat, sel_index, 1)
+                if grouped_grads is None:
+                    grouped_grads = cvmm_group_routes(grads_flat, sel_index, 1)
                 chunk_grad_x = torch.empty((total_routes, N), device=x.device, dtype=x.dtype)
                 M = total_routes
                 grid = lambda META: (
@@ -1225,9 +1227,9 @@ def create_kernels():
                     triton.cdiv(N, META['BLOCK_N']),
                 )
                 cvmm_grouped_bwd_x_kernel[grid](
-                    grouped_grad_chunk, keys_t, chunk_grad_x, sel_index, sel_flat,
+                    grouped_grads, keys_t, chunk_grad_x, sel_index, sel_flat,
                     M, N, K, n_experts,
-                    grouped_grad_chunk.stride(0), grouped_grad_chunk.stride(1),
+                    grouped_grads.stride(0), grouped_grads.stride(1),
                     keys_t.stride(0), keys_t.stride(1), keys_t.stride(2),
                     chunk_grad_x.stride(0), chunk_grad_x.stride(1),
                     sel_index.stride(0), sel_flat.stride(0),
