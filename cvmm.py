@@ -101,7 +101,7 @@ def create_kernels():
             triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=2),
             triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
         ],
-        key=['M', 'N', 'K', 'dtype_id', 'out_dtype_id', 'allow_tf32']
+        key=['M', 'N', 'K', 'dtype_id', 'out_dtype_id', 'allow_tf32', 'FAST_SINGLE_EXPERT']
     )
     @triton.jit
     def cvmm_kernel(
@@ -118,7 +118,7 @@ def create_kernels():
         stride_index, stride_sel, stride_out_index,
         out_index_is_none: tl.constexpr,
         dtype_id: tl.constexpr, out_dtype_id: tl.constexpr, allow_tf32: tl.constexpr,
-        ACCUMULATE_OUTPUT: tl.constexpr,
+        ACCUMULATE_OUTPUT: tl.constexpr, FAST_SINGLE_EXPERT: tl.constexpr,
         # Meta-parameters
         BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
         GROUP_SIZE_M: tl.constexpr
@@ -144,7 +144,10 @@ def create_kernels():
 
         sel_first = tl.load(sel_ptr + pid_m * BLOCK_SIZE_M * stride_sel)
         sel_last = tl.load(sel_ptr + (min((pid_m + 1) * BLOCK_SIZE_M, M) - 1) * stride_sel)
-        sel_all = tl.load(sel_ptr + stride_sel * ((pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M))
+        if FAST_SINGLE_EXPERT:
+            single_expert_block = sel_first == sel_last
+        else:
+            sel_all = tl.load(sel_ptr + stride_sel * ((pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M))
 
         for matrix_id in range(sel_first, sel_last + 1):
             # ----------------------------------------------------------
@@ -210,7 +213,14 @@ def create_kernels():
 
             offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
             c_ptrs = c_ptr + stride_cm * remap_offs_cm[:, None] + stride_cn * offs_cn[None, :]
-            c_mask = ((offs_cm[:, None] < M) & (sel_all[:, None] == matrix_id)) & (offs_cn[None, :] < N)
+            if FAST_SINGLE_EXPERT:
+                if single_expert_block:
+                    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+                else:
+                    sel_all = tl.load(sel_ptr + stride_sel * (offs_cm % M))
+                    c_mask = ((offs_cm[:, None] < M) & (sel_all[:, None] == matrix_id)) & (offs_cn[None, :] < N)
+            else:
+                c_mask = ((offs_cm[:, None] < M) & (sel_all[:, None] == matrix_id)) & (offs_cn[None, :] < N)
             if ACCUMULATE_OUTPUT:
                 c_prev = tl.load(c_ptrs, mask=c_mask, other=0.0)
                 tl.store(c_ptrs, c_prev + c, mask=c_mask)
@@ -492,6 +502,7 @@ def create_kernels():
 
     @triton.autotune(
         configs=[
+            triton.Config({'BLOCK_ROUTES': 128, 'BLOCK_M': 128, 'BLOCK_N': 64}, num_stages=3, num_warps=4),
             triton.Config({'BLOCK_ROUTES': 32, 'BLOCK_M': 128, 'BLOCK_N': 128}, num_stages=4, num_warps=4),
             triton.Config({'BLOCK_ROUTES': 32, 'BLOCK_M': 128, 'BLOCK_N': 64}, num_stages=4, num_warps=4),
             triton.Config({'BLOCK_ROUTES': 32, 'BLOCK_M': 64, 'BLOCK_N': 128}, num_stages=4, num_warps=4),
@@ -808,6 +819,7 @@ def create_kernels():
             out_dtype_id=dtype_to_type_id(out.dtype),
             allow_tf32=False, #torch.backends.cuda.matmul.allow_tf32
             ACCUMULATE_OUTPUT=False,
+            FAST_SINGLE_EXPERT=out_index_is_none and N <= 1024,
         )
 
         return out.view(*sel_shape, N)
@@ -849,6 +861,7 @@ def create_kernels():
             out_dtype_id=dtype_to_type_id(out.dtype),
             allow_tf32=False, #torch.backends.cuda.matmul.allow_tf32
             ACCUMULATE_OUTPUT=False,
+            FAST_SINGLE_EXPERT=out_index_is_none and N <= 1024,
         )
 
 
@@ -886,6 +899,7 @@ def create_kernels():
             out_dtype_id=dtype_to_type_id(out.dtype),
             allow_tf32=False, #torch.backends.cuda.matmul.allow_tf32
             ACCUMULATE_OUTPUT=accumulate,
+            FAST_SINGLE_EXPERT=False,
         )
 
 

@@ -52,6 +52,29 @@ a precision-identical replacement.
 | `ff_up_4096_stress` | 0.381 | 1.898 | 3.652 | 5.931 | 2.29x | 5.57x | 6.3% | 1.46x |
 | `ff_down_4096_weighted_stress` | 0.300 | 2.192 | 3.348 | 5.840 | 2.55x | 2.12x | 6.1% | 2.90x |
 
+
+### Larger FFN expert-width probes
+
+Measured on the same GPU on 2026-06-28 with the PG199 CUDA-event workaround
+enabled. These rows extend the FFN up/down projection probes to hidden widths
+256 and 512; all fit with the batch sizes shown in `benchmark_moe_shapes.py`.
+Raw score columns are milliseconds per iteration from 8 iterations.
+
+| Shape | sel ms | fw ms | bw ms | total ms |
+| --- | ---: | ---: | ---: | ---: |
+| `ff_up_1024_h256` | 0.373 | 1.702 | 3.665 | 5.740 |
+| `ff_down_1024_h256_weighted` | 0.369 | 2.544 | 3.836 | 6.749 |
+| `ff_up_1024_h512` | 0.342 | 2.706 | 6.425 | 9.472 |
+| `ff_down_1024_h512_weighted` | 0.270 | 3.393 | 6.839 | 10.502 |
+| `ff_up_2048_h256` | 0.363 | 2.568 | 4.532 | 7.463 |
+| `ff_down_2048_h256_weighted` | 0.313 | 2.719 | 4.705 | 7.738 |
+| `ff_up_2048_h512` | 0.298 | 4.536 | 8.902 | 13.736 |
+| `ff_down_2048_h512_weighted` | 0.265 | 4.537 | 8.550 | 13.351 |
+| `ff_up_4096_h256_stress` | 0.316 | 3.022 | 5.802 | 9.140 |
+| `ff_down_4096_h256_weighted_stress` | 0.253 | 3.313 | 5.519 | 9.085 |
+| `ff_up_4096_h512_stress` | 0.255 | 5.200 | 10.418 | 15.873 |
+| `ff_down_4096_h512_weighted_stress` | 0.223 | 5.410 | 9.983 | 15.617 |
+
 ### FFN stack
 
 Measured on the same GPU on 2026-06-28 with the PG199 workaround disabled.
