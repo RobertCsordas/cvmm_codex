@@ -14,6 +14,19 @@ CUDA-event workaround enabled in `benchmark_moe_shapes.py`.
 The raw score columns are milliseconds per iteration from
 `python3 benchmark_moe_shapes.py 8`.
 
+The original/current correctness benchmark compares this checkout with the
+historical baseline commit `27554dc` in separate Python processes, using a
+temporary `cvmm_original.py` module so the current `cvmm.py` is not modified or
+shadowed in-repo:
+
+```bash
+python3 benchmark_correctness_original.py --n-iters 1
+```
+
+Use `--dtype float32`, `--dtype bf16_amp`, or `--dtype bf16_params` to run one
+precision mode, and `--case <name>` to run one shape.
+
+
 The ratio columns use kernel time only (`fw + bw`):
 
 - `vs original`: `(original cvmm fw+bw) / (current fw+bw)`, using commit
