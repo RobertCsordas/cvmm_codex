@@ -94,7 +94,7 @@ def benchmark_cvmm_ffn(s: FFNShape, n_iters: int) -> BenchResult:
             weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-20)
             sel_up = cvmm_prepare_sel2(sel)
             hidden = F.gelu(cvmm(x, sel_up, w_up))
-            sel_down = cvmm_prepare_sel2(sel, weights, route_input=True)
+            sel_down = cvmm_prepare_sel2(sel_up, weights, route_input=True)
             return cvmm(hidden.view(s.B, s.T, s.K, s.H), sel_down, w_down)
 
     return _bench(n_iters, [x, gate, w_up, w_down], forward)

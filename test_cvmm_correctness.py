@@ -69,10 +69,30 @@ def test_weighted_route_input():
     _check_case(True, route_input=True)
 
 
+def test_weighted_route_input_reused_selector():
+    torch.manual_seed(1251)
+    device = "cuda"
+    b, t, d, out_d, n_experts, top_k = 3, 5, 16, 11, 7, 3
+    x = torch.randn(b, t, top_k, d, device=device, dtype=torch.bfloat16, requires_grad=True)
+    keys = torch.randn(n_experts, d, out_d, device=device, dtype=torch.float32, requires_grad=True)
+    sel = torch.randint(0, n_experts, (b, t, top_k), device=device)
+    weights = torch.randn(b, t, top_k, device=device, dtype=torch.float32, requires_grad=True)
+
+    base_sel = cvmm_prepare_sel2(sel)
+    reused = cvmm_prepare_sel2(base_sel, weights, route_input=True)
+    fresh = cvmm_prepare_sel2(sel, weights, route_input=True)
+
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        actual = cvmm(x, reused, keys)
+        expected = cvmm(x, fresh, keys)
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=0, atol=0)
+
+
 if __name__ == "__main__":
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required for cvmm correctness tests")
     test_unweighted()
     test_weighted()
     test_weighted_route_input()
+    test_weighted_route_input_reused_selector()
     print("cvmm correctness tests passed")

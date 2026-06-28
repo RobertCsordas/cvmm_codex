@@ -1697,8 +1697,14 @@ def cvmm(x: torch.Tensor, sel: Union[torch.Tensor, CVMMSel], keys: torch.Tensor)
     return CVMM.apply(x, sel.raw_sel, sel.sel_index, sel.sel, keys, sel.out_index, sel.reduction_weight)
 
 
-def cvmm_prepare_sel2(sel: torch.Tensor, w: Optional[torch.Tensor] = None, route_input: bool = False) -> CVMMSel:
+def cvmm_prepare_sel2(sel: Union[torch.Tensor, CVMMSel], w: Optional[torch.Tensor] = None, route_input: bool = False) -> CVMMSel:
     # Has multiple selections for each batch element
+    if isinstance(sel, CVMMSel):
+        if route_input:
+            route_index = sel.out_index if sel.out_index is not None else sel.sel_index
+            return CVMMSel(sel.raw_sel, sel.sel, route_index, None, w)
+        return CVMMSel(sel.raw_sel, sel.sel, sel.sel_index, sel.out_index, w)
+
     n_per_batch = sel.shape[-1]
 
     fsel = sel.flatten().to(torch.int32)
