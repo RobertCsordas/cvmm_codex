@@ -88,15 +88,22 @@ Measured on the same GPU on 2026-06-28 with the PG199 workaround disabled.
 Rows are full top-k MoE FFN stacks: gate matmul, softmax/top-k, up projection,
 GELU, weighted down projection/combine, and backward. Raw score columns are
 milliseconds per iteration from `benchmark_ffn_moe.py` with 5 iterations.
-`Tutel / CVMM` is the total-time ratio, so lower is faster and `1.0x` is parity
-with the CVMM FFN stack.
+Tutel was measured from Microsoft Tutel source commit `add1bf1`. `Tutel / CVMM`
+is the total-time ratio, so lower is faster and `1.0x` is parity with the CVMM
+FFN stack.
 
 | Shape | CVMM fw ms | CVMM bw ms | CVMM total ms | Tutel fw ms | Tutel bw ms | Tutel total ms | Tutel / CVMM |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | `ffn_1024` | 3.954 | 5.232 | 9.186 | 22.870 | 17.100 | 39.970 | 4.35x |
+| `ffn_1024_h256` | 5.052 | 7.647 | 12.699 | 24.253 | 20.049 | 44.303 | 3.49x |
+| `ffn_1024_h512` | 7.207 | 13.594 | 20.801 | 25.919 | 25.985 | 51.904 | 2.50x |
 | `ffn_2048` | 4.131 | 5.871 | 10.001 | 18.580 | 17.724 | 36.304 | 3.63x |
+| `ffn_2048_h256` | 5.894 | 9.195 | 15.090 | 19.529 | 23.663 | 43.192 | 2.86x |
+| `ffn_2048_h512` | 9.628 | 17.623 | 27.250 | 22.948 | 34.973 | 57.921 | 2.13x |
 | `ffn_768` | 2.402 | 2.945 | 5.348 | 8.934 | 6.436 | 15.371 | 2.87x |
 | `ffn_4096_stress` | 4.122 | 6.530 | 10.652 | 10.900 | 17.389 | 28.289 | 2.66x |
+| `ffn_4096_h256_stress` | 6.606 | 11.092 | 17.699 | 14.362 | 27.881 | 42.243 | 2.39x |
+| `ffn_4096_h512_stress` | 11.029 | 20.269 | 31.298 | 21.226 | 49.606 | 70.832 | 2.26x |
 
 The weighted down/O projections are now close to the dense-equivalent bound on
 the main 1024-2048 shapes. The remaining large gap is mostly in the unweighted
