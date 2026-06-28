@@ -58,22 +58,25 @@ a precision-identical replacement.
 Measured on the same GPU on 2026-06-28 with the PG199 CUDA-event workaround
 enabled. These rows extend the FFN up/down projection probes to hidden widths
 256 and 512; all fit with the batch sizes shown in `benchmark_moe_shapes.py`.
-Raw score columns are milliseconds per iteration from 8 iterations.
+Raw score columns are milliseconds per iteration from 8 iterations. Original
+baseline columns use kernel time (`fw + bw`) from commit `27554dc`; the temporary
+selector shim only adapts that baseline to the current route-input benchmark
+shape API and does not change its kernels.
 
-| Shape | sel ms | fw ms | bw ms | total ms |
-| --- | ---: | ---: | ---: | ---: |
-| `ff_up_1024_h256` | 0.373 | 1.702 | 3.665 | 5.740 |
-| `ff_down_1024_h256_weighted` | 0.369 | 2.544 | 3.836 | 6.749 |
-| `ff_up_1024_h512` | 0.342 | 2.706 | 6.425 | 9.472 |
-| `ff_down_1024_h512_weighted` | 0.270 | 3.393 | 6.839 | 10.502 |
-| `ff_up_2048_h256` | 0.363 | 2.568 | 4.532 | 7.463 |
-| `ff_down_2048_h256_weighted` | 0.313 | 2.719 | 4.705 | 7.738 |
-| `ff_up_2048_h512` | 0.298 | 4.536 | 8.902 | 13.736 |
-| `ff_down_2048_h512_weighted` | 0.265 | 4.537 | 8.550 | 13.351 |
-| `ff_up_4096_h256_stress` | 0.316 | 3.022 | 5.802 | 9.140 |
-| `ff_down_4096_h256_weighted_stress` | 0.253 | 3.313 | 5.519 | 9.085 |
-| `ff_up_4096_h512_stress` | 0.255 | 5.200 | 10.418 | 15.873 |
-| `ff_down_4096_h512_weighted_stress` | 0.223 | 5.410 | 9.983 | 15.617 |
+| Shape | sel ms | fw ms | bw ms | total ms | orig fw+bw ms | vs original |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `ff_up_1024_h256` | 0.373 | 1.702 | 3.665 | 5.740 | 12.435 | 2.32x |
+| `ff_down_1024_h256_weighted` | 0.369 | 2.544 | 3.836 | 6.749 | 16.196 | 2.54x |
+| `ff_up_1024_h512` | 0.342 | 2.706 | 6.425 | 9.472 | 22.114 | 2.42x |
+| `ff_down_1024_h512_weighted` | 0.270 | 3.393 | 6.839 | 10.502 | 26.252 | 2.57x |
+| `ff_up_2048_h256` | 0.363 | 2.568 | 4.532 | 7.463 | 17.321 | 2.44x |
+| `ff_down_2048_h256_weighted` | 0.313 | 2.719 | 4.705 | 7.738 | 18.942 | 2.55x |
+| `ff_up_2048_h512` | 0.298 | 4.536 | 8.902 | 13.736 | 32.856 | 2.45x |
+| `ff_down_2048_h512_weighted` | 0.265 | 4.537 | 8.550 | 13.351 | 32.588 | 2.49x |
+| `ff_up_4096_h256_stress` | 0.316 | 3.022 | 5.802 | 9.140 | 24.645 | 2.79x |
+| `ff_down_4096_h256_weighted_stress` | 0.253 | 3.313 | 5.519 | 9.085 | 23.934 | 2.71x |
+| `ff_up_4096_h512_stress` | 0.255 | 5.200 | 10.418 | 15.873 | 47.290 | 3.03x |
+| `ff_down_4096_h512_weighted_stress` | 0.223 | 5.410 | 9.983 | 15.617 | 44.059 | 2.86x |
 
 ### FFN stack
 
