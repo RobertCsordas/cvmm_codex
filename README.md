@@ -133,6 +133,54 @@ faster and `1.0x` is parity with CVMM.
 | `small_d256_h64_e32_k4` | 5.044 | 21.692 | 4.30x | 32.933 | 6.53x |
 | `small_d512_h128_e64_k4` | 4.835 | 37.624 | 7.78x | 56.159 | 11.62x |
 
+### RTX 3090 probes
+
+Measured on an `NVIDIA GeForce RTX 3090` on 2026-06-28 with
+`CUDA_VISIBLE_DEVICES=4`. The PG199 workaround was disabled because this GPU
+does not have the broken CUDA event counters. All projection shapes fit in 24 GB
+VRAM. Projection rows are from `benchmark_moe_shapes.py` with 8 iterations; FFN
+stack rows are from `benchmark_ffn_moe.py cvmm 5`.
+
+| Projection shape | sel ms | fw ms | bw ms | total ms |
+| --- | ---: | ---: | ---: | ---: |
+| `ff_up_1024` | 0.357 | 1.499 | 3.162 | 5.018 |
+| `ff_down_1024_weighted` | 0.393 | 2.576 | 2.612 | 5.580 |
+| `ff_up_1024_h256` | 0.359 | 2.223 | 4.735 | 7.317 |
+| `ff_down_1024_h256_weighted` | 0.324 | 3.195 | 4.650 | 8.170 |
+| `ff_up_1024_h512` | 0.308 | 3.899 | 7.919 | 12.126 |
+| `ff_down_1024_h512_weighted` | 0.251 | 5.054 | 8.764 | 14.069 |
+| `ff_up_2048` | 0.402 | 2.148 | 4.037 | 6.588 |
+| `ff_down_2048_weighted` | 0.319 | 2.638 | 3.356 | 6.313 |
+| `ff_up_2048_h256` | 0.370 | 3.842 | 6.377 | 10.590 |
+| `ff_down_2048_h256_weighted` | 0.305 | 3.846 | 6.184 | 10.335 |
+| `ff_up_2048_h512` | 0.334 | 6.452 | 11.440 | 18.226 |
+| `ff_down_2048_h512_weighted` | 0.247 | 6.547 | 11.335 | 18.130 |
+| `switch_v_1024` | 0.354 | 2.133 | 7.535 | 10.022 |
+| `switch_o_1024_weighted` | 0.282 | 4.279 | 3.922 | 8.483 |
+| `switch_v_2048_h32` | 0.252 | 4.271 | 15.775 | 20.298 |
+| `switch_o_2048_h32_weighted` | 0.262 | 8.092 | 7.338 | 15.692 |
+| `ff_up_768` | 0.274 | 0.694 | 1.524 | 2.491 |
+| `switch_o_768_weighted` | 0.374 | 1.808 | 1.767 | 3.949 |
+| `ff_up_4096_stress` | 0.423 | 2.645 | 4.520 | 7.588 |
+| `ff_down_4096_weighted_stress` | 0.278 | 2.698 | 4.197 | 7.173 |
+| `ff_up_4096_h256_stress` | 0.289 | 4.242 | 7.424 | 11.954 |
+| `ff_down_4096_h256_weighted_stress` | 0.249 | 4.101 | 7.568 | 11.918 |
+| `ff_up_4096_h512_stress` | 0.254 | 7.677 | 13.642 | 21.573 |
+| `ff_down_4096_h512_weighted_stress` | 0.211 | 7.306 | 13.890 | 21.407 |
+
+| FFN shape | CVMM fw ms | CVMM bw ms | CVMM total ms |
+| --- | ---: | ---: | ---: |
+| `ffn_1024` | 4.387 | 6.455 | 10.842 |
+| `ffn_1024_h256` | 6.205 | 10.297 | 16.502 |
+| `ffn_1024_h512` | 10.090 | 17.755 | 27.845 |
+| `ffn_2048` | 5.006 | 7.724 | 12.731 |
+| `ffn_2048_h256` | 8.090 | 12.798 | 20.887 |
+| `ffn_2048_h512` | 13.499 | 23.003 | 36.502 |
+| `ffn_768` | 2.434 | 2.996 | 5.430 |
+| `ffn_4096_stress` | 5.441 | 8.604 | 14.045 |
+| `ffn_4096_h256_stress` | 8.666 | 15.019 | 23.685 |
+| `ffn_4096_h512_stress` | 15.619 | 27.328 | 42.947 |
+
 The weighted down/O projections are now close to the dense-equivalent bound on
 the main 1024-2048 shapes. The remaining large gap is mostly in the unweighted
 up/V projections, especially the 2048 and 4096 stress cases.

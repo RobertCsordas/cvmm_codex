@@ -8,7 +8,7 @@ import time
 import torch
 import triton
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 
 import cvmm as cvmm_module
 from cvmm import CVMMSel, cvmm, cvmm_prepare_sel2

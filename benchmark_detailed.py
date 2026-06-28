@@ -8,7 +8,7 @@ import time
 import subprocess
 import sys
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 
 from cvmm import cvmm_prepare_sel2, cvmm
 
