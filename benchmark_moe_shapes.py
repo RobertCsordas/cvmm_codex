@@ -44,8 +44,16 @@ experiments: List[ExperimentShape] = [
     # SigmaMoE feed-forward up/down projections from moeut.py.
     ExperimentShape("ff_up_1024", 8, 2048, 1024, 128, 8, 512),
     ExperimentShape("ff_down_1024_weighted", 8, 2048, 128, 1024, 8, 512, weighted=True, route_input=True),
+    ExperimentShape("ff_up_1024_h256", 8, 2048, 1024, 256, 8, 512),
+    ExperimentShape("ff_down_1024_h256_weighted", 8, 2048, 256, 1024, 8, 512, weighted=True, route_input=True),
+    ExperimentShape("ff_up_1024_h512", 8, 2048, 1024, 512, 8, 512),
+    ExperimentShape("ff_down_1024_h512_weighted", 8, 2048, 512, 1024, 8, 512, weighted=True, route_input=True),
     ExperimentShape("ff_up_2048", 4, 2048, 2048, 128, 8, 512),
     ExperimentShape("ff_down_2048_weighted", 4, 2048, 128, 2048, 8, 512, weighted=True, route_input=True),
+    ExperimentShape("ff_up_2048_h256", 4, 2048, 2048, 256, 8, 512),
+    ExperimentShape("ff_down_2048_h256_weighted", 4, 2048, 256, 2048, 8, 512, weighted=True, route_input=True),
+    ExperimentShape("ff_up_2048_h512", 4, 2048, 2048, 512, 8, 512),
+    ExperimentShape("ff_down_2048_h512_weighted", 4, 2048, 512, 2048, 8, 512, weighted=True, route_input=True),
     # SwitchHead v/o projections. N_E is n_heads * n_experts and K is n_heads * moe_k.
     ExperimentShape("switch_v_1024", 8, 2048, 1024, 64, 32, 512),
     ExperimentShape("switch_o_1024_weighted", 8, 2048, 64, 1024, 32, 512, weighted=True, route_input=True),
@@ -57,6 +65,10 @@ experiments: List[ExperimentShape] = [
     # Larger-model stress probes; 1024-2048 is the main decision range.
     ExperimentShape("ff_up_4096_stress", 2, 1024, 4096, 128, 8, 512),
     ExperimentShape("ff_down_4096_weighted_stress", 2, 1024, 128, 4096, 8, 512, weighted=True, route_input=True),
+    ExperimentShape("ff_up_4096_h256_stress", 2, 1024, 4096, 256, 8, 512),
+    ExperimentShape("ff_down_4096_h256_weighted_stress", 2, 1024, 256, 4096, 8, 512, weighted=True, route_input=True),
+    ExperimentShape("ff_up_4096_h512_stress", 2, 1024, 4096, 512, 8, 512),
+    ExperimentShape("ff_down_4096_h512_weighted_stress", 2, 1024, 512, 4096, 8, 512, weighted=True, route_input=True),
 ]
 
 
